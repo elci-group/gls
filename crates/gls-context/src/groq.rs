@@ -2,14 +2,15 @@
 //!
 //! # Model selection
 //!
-//! The active model is resolved at construction time:
-//!   1. `GLS_GROQ_MODEL` env var
-//!   2. `--model` CLI flag passed through `ContextConfig::model`
-//!   3. `DEFAULT_MODEL` constant (current, non-deprecated model)
+//! The active model is resolved by `active_model()` on first use:
+//!   1. Try the model from `GLS_GROQ_MODEL` env var / `--model` flag /
+//!      `DEFAULT_MODEL` constant with a real 1-token probe call.
+//!   2. On 404 (no access) try each entry in `FALLBACK_MODELS` in order.
+//!   3. On 401/403 (bad key) fail immediately — no point trying fallbacks.
+//!   4. If all candidates fail, emit `ProviderUnavailable` once and skip
+//!      contextualisation for this run entirely.
 //!
-//! If the resolved model is decommissioned, `resolve_model()` probes the
-//! Groq models endpoint and silently picks the first available fast model.
-//! Provider failures always degrade gracefully — never panic, never spam.
+//! The resolved model is cached; the probe runs at most once per invocation.
 
 use gls_core::{
     event::{ContextAnnotation, Descriptor, MetricBundle, PipelineEvent},
@@ -25,7 +26,6 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, OnceCell};
 
 const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
 const CONTEXT_VERSION: &str = "1.0";
 
 /// Current recommended fast Groq model.
@@ -136,10 +136,16 @@ impl Contextualiser {
         }
     }
 
-    /// Resolve the actual model to use, probing Groq if needed.
+    /// Resolve the actual model to use.
     ///
-    /// The result is cached in `resolved_model` so the probe only runs once
-    /// per `Contextualiser` instance.
+    /// Strategy:
+    ///   1. Try the configured model with a real 1-token probe call.
+    ///   2. On 401/403 → API key is bad → return Err immediately (no point
+    ///      trying fallbacks).
+    ///   3. On 404/model_not_found → try each FALLBACK_MODELS entry in order.
+    ///   4. If all fallbacks fail → return Err so caller emits ProviderUnavailable.
+    ///
+    /// Result cached in `resolved_model`; probe runs at most once per instance.
     async fn active_model(&self) -> Result<String, String> {
         if let Some(m) = self.resolved_model.get() {
             return Ok(m.clone());
@@ -151,50 +157,72 @@ impl Contextualiser {
             .clone()
             .ok_or_else(|| "GROQ_API_KEY not set".to_string())?;
 
-        let resolved = self
-            .probe_model(&api_key, &self.config.model)
-            .await
-            .unwrap_or_else(|_| self.config.model.clone());
-
-        // Store; if another task raced us, just use whatever was stored.
-        let _ = self.resolved_model.set(resolved.clone());
-        Ok(self.resolved_model.get().cloned().unwrap_or(resolved))
-    }
-
-    /// Check whether `preferred` is available; if not, walk `FALLBACK_MODELS`
-    /// and return the first one the API reports as active.
-    async fn probe_model(&self, api_key: &str, preferred: &str) -> Result<String, String> {
-        let resp = self
-            .client
-            .get(GROQ_MODELS_URL)
-            .bearer_auth(api_key)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            // Can't reach models endpoint — trust the configured model.
-            return Ok(preferred.to_string());
-        }
-
-        let body: GroqModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
-        let available: std::collections::HashSet<String> =
-            body.data.into_iter().map(|m| m.id).collect();
-
-        // Prefer the requested model if it's still listed.
-        if available.contains(preferred) {
-            return Ok(preferred.to_string());
-        }
-
-        // Walk the fallback list.
-        for &candidate in FALLBACK_MODELS {
-            if available.contains(candidate) {
-                return Ok(candidate.to_string());
+        // Build the full candidate list: configured model first, then fallbacks.
+        let mut candidates: Vec<&str> = vec![self.config.model.as_str()];
+        for &f in FALLBACK_MODELS {
+            if f != self.config.model.as_str() {
+                candidates.push(f);
             }
         }
 
-        // Nothing matched — return preferred and let the call fail naturally.
-        Ok(preferred.to_string())
+        for candidate in candidates {
+            match self.probe_access(&api_key, candidate).await {
+                ProbeResult::Ok => {
+                    let _ = self.resolved_model.set(candidate.to_string());
+                    return Ok(candidate.to_string());
+                }
+                ProbeResult::NoAccess => {
+                    // This model not available to this key; try next.
+                    continue;
+                }
+                ProbeResult::AuthFailed(reason) => {
+                    // Bad key — all models will fail.
+                    return Err(format!("authentication failed: {reason}"));
+                }
+                ProbeResult::NetworkError(e) => {
+                    // Can't reach Groq at all.
+                    return Err(format!("network error: {e}"));
+                }
+            }
+        }
+
+        Err("no accessible Groq model found for this API key".to_string())
+    }
+
+    /// Make a minimal 1-token completion call to confirm this key can access
+    /// `model`.  Returns a `ProbeResult` rather than a `Result` so the caller
+    /// can distinguish auth failures from access failures.
+    async fn probe_access(&self, api_key: &str, model: &str) -> ProbeResult {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let resp = match self
+            .client
+            .post(GROQ_API_URL)
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r)  => r,
+            Err(e) => return ProbeResult::NetworkError(e.to_string()),
+        };
+
+        match resp.status().as_u16() {
+            200 => ProbeResult::Ok,
+            401 | 403 => {
+                let text = resp.text().await.unwrap_or_default();
+                ProbeResult::AuthFailed(text)
+            }
+            404 => ProbeResult::NoAccess,
+            _ => {
+                // Unexpected status — treat as NoAccess so we try the next model.
+                ProbeResult::NoAccess
+            }
+        }
     }
 
     async fn contextualise_one(
@@ -352,6 +380,20 @@ Important:
 - Return valid JSON only.
 "#;
 
+// ── Internal types ────────────────────────────────────────────────────────────
+
+/// Result of a single-model access probe.
+enum ProbeResult {
+    /// The model responded successfully.
+    Ok,
+    /// The key has no access to this model (404 / model_not_found).
+    NoAccess,
+    /// Authentication failed entirely (401 / 403) — no point trying fallbacks.
+    AuthFailed(String),
+    /// Network-level error — cannot reach Groq.
+    NetworkError(String),
+}
+
 // ── Groq wire types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -367,14 +409,4 @@ struct GroqChoice {
 #[derive(Debug, Deserialize)]
 struct GroqMessage {
     content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GroqModelsResponse {
-    data: Vec<GroqModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GroqModel {
-    id: String,
 }
