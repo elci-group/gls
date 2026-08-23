@@ -1,0 +1,8 @@
+[package]
+name    = "gls-bound"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gls-core    = { path = "../gls-core" }
+serde       = { version = "1", features = ["derive"] }

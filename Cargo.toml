@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gls-core",
+    "crates/gls-discover",
+    "crates/gls-type",
+    "crates/gls-bart",
+    "crates/gls-index",
+    "crates/gls-bound",
+    "crates/gls-context",
+    "crates/gls-metrics",
+    "crates/gls-padagonia",
+    "crates/gls-render",
+    "bin/gls",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors  = ["gls contributors"]
+license  = "MIT"
+
+[profile.release]
+lto     = true
+codegen-units = 1

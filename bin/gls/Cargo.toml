@@ -1,0 +1,24 @@
+[package]
+name    = "gls"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gls"
+path = "src/main.rs"
+
+[dependencies]
+gls-core       = { path = "../../crates/gls-core" }
+gls-discover   = { path = "../../crates/gls-discover" }
+gls-type       = { path = "../../crates/gls-type" }
+gls-bart       = { path = "../../crates/gls-bart" }
+gls-index      = { path = "../../crates/gls-index" }
+gls-bound      = { path = "../../crates/gls-bound" }
+gls-context    = { path = "../../crates/gls-context" }
+gls-metrics    = { path = "../../crates/gls-metrics" }
+gls-padagonia  = { path = "../../crates/gls-padagonia" }
+gls-render     = { path = "../../crates/gls-render" }
+tokio          = { version = "1", features = ["full"] }
+clap           = { version = "4", features = ["derive"] }
+thiserror      = "1"
+serde_json     = "1"

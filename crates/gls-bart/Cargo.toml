@@ -1,0 +1,10 @@
+[package]
+name    = "gls-bart"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gls-core    = { path = "../gls-core" }
+tokio       = { version = "1", features = ["full"] }
+walkdir     = "2"
+thiserror   = "1"
