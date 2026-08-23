@@ -86,13 +86,37 @@ impl Contextualiser {
         }
     }
 
-    /// Contextualise a batch of descriptors, emitting `ContextStarted`,
-    /// `ContextUpdated`, and `MetricsUpdated` events for each.
+    /// Pre-flight check: resolve the model and verify the provider is reachable.
+    ///
+    /// Returns `Ok(model_name)` on success, or `Err(reason)` if the provider
+    /// should be considered unavailable for this run.
+    pub async fn preflight(&self) -> Result<String, String> {
+        self.active_model().await
+    }
+
+    /// Contextualise a batch of descriptors.
+    ///
+    /// Calls `preflight()` first.  If the provider is unavailable, emits a
+    /// single `ProviderUnavailable` event and returns without processing any
+    /// objects.  Individual per-object failures emit `Warning` events.
     pub async fn contextualise(
         &self,
         descriptors: Vec<Descriptor>,
         tx: broadcast::Sender<PipelineEvent>,
     ) {
+        // ── Pre-flight ────────────────────────────────────────────────────────
+        match self.preflight().await {
+            Err(reason) => {
+                let _ = tx.send(PipelineEvent::ProviderUnavailable {
+                    provider: "groq".to_string(),
+                    reason,
+                });
+                return;
+            }
+            Ok(_) => {}
+        }
+
+        // ── Per-object contextualisation ──────────────────────────────────────
         for desc in descriptors {
             let path = desc.path.clone();
             let _ = tx.send(PipelineEvent::ContextStarted { path: path.clone() });

@@ -88,6 +88,9 @@ pub enum PipelineEvent {
     Persisted { path: PathBuf, revision: String },
     /// A non-fatal warning from any phase.
     Warning { path: Option<PathBuf>, message: String },
+    /// A context provider is unavailable for this run.
+    /// Emitted at most once per run; disables contextualisation globally.
+    ProviderUnavailable { provider: String, reason: String },
     /// The pipeline has finished all phases for all objects.
     PipelineComplete,
 }
@@ -96,16 +99,17 @@ impl PipelineEvent {
     /// Returns the path this event is about, if any.
     pub fn path(&self) -> Option<&PathBuf> {
         match self {
-            PipelineEvent::Discovery(e)        => Some(&e.path),
+            PipelineEvent::Discovery(e)               => Some(&e.path),
             PipelineEvent::TypeDetected { path, .. }  => Some(path),
-            PipelineEvent::Measured(m)         => Some(&m.path),
-            PipelineEvent::Indexed(d)          => Some(&d.path),
+            PipelineEvent::Measured(m)                => Some(&m.path),
+            PipelineEvent::Indexed(d)                 => Some(&d.path),
             PipelineEvent::ContextStarted { path }    => Some(path),
-            PipelineEvent::ContextUpdated(a)   => Some(&a.path),
-            PipelineEvent::MetricsUpdated(m)   => Some(&m.path),
+            PipelineEvent::ContextUpdated(a)          => Some(&a.path),
+            PipelineEvent::MetricsUpdated(m)          => Some(&m.path),
             PipelineEvent::Persisted { path, .. }     => Some(path),
             PipelineEvent::Warning { path, .. }       => path.as_ref(),
-            PipelineEvent::PipelineComplete            => None,
+            PipelineEvent::ProviderUnavailable { .. } => None,
+            PipelineEvent::PipelineComplete           => None,
         }
     }
 }

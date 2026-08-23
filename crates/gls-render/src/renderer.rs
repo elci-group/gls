@@ -1,21 +1,36 @@
 //! Retained-mode TTY renderer.
 //!
+//! # Invariant
+//!
+//! **One filesystem object = exactly one stable terminal row.**
+//!
+//! A row's content may change arbitrarily many times, but a row is never
+//! duplicated and never appended.
+//!
 //! # Design
 //!
-//! The screen is modelled as a fixed-height grid of *rows*, one per
-//! filesystem entry.  Each row is 1 or 2 terminal lines tall depending on
-//! whether a sub-line is currently showing.
+//! The screen is a fixed-height grid, one row per entry.  Each row is 1 or 2
+//! terminal lines tall (primary + optional sub-line).
 //!
-//! On every tick/event the renderer:
-//!   1. Computes the new content for every row.
-//!   2. Compares it against what was drawn last frame.
-//!   3. Moves the cursor **only to the rows that changed** and redraws them.
+//! ## Event loop
 //!
-//! The cursor is left at the bottom of the grid after every frame.  Before
-//! the next frame it is moved back up by the total number of terminal lines
-//! that were drawn last time.
+//! Rather than rendering on every event, the loop drains *all* currently
+//! pending events from the channel in a single synchronous pass, then renders
+//! once.  This prevents the burst of TYPE/BART events that arrive in quick
+//! succession from causing repeated redraws of the same partial state.
 //!
-//! This means the display is spatially stable: row 0 is always row 0.
+//! ## Redraw
+//!
+//! Before each frame: `MoveToPreviousLine(prev_line_count)` returns the cursor
+//! to the top of the grid.  Only rows whose content changed since the last
+//! frame are redrawn; unchanged rows are skipped with `MoveToNextLine`.
+//!
+//! ## stderr isolation
+//!
+//! While the live grid is displayed, nothing writes to stderr.  Provider
+//! warnings are stored in `pending_warnings` and flushed to stderr *after*
+//! the grid exits (on `PipelineComplete` or channel close).  This prevents
+//! API error bodies from appearing inside the terminal grid.
 
 use crate::{
     format::{context_line, metrics_line, type_line},
@@ -45,7 +60,7 @@ use tokio::sync::broadcast;
 pub enum OutputMode {
     /// Animated, retained-mode TTY output.
     Tty,
-    /// Plain text — all events buffered, final snapshot printed once.
+    /// Plain text — buffer all events, print a clean snapshot when done.
     Plain,
     /// One JSON object per pipeline event on stdout.
     Json,
@@ -80,9 +95,7 @@ fn atty_check() -> bool {
         unsafe { libc::isatty(io::stdout().as_raw_fd()) == 1 }
     }
     #[cfg(not(unix))]
-    {
-        false
-    }
+    { false }
 }
 
 /// The renderer.
@@ -95,8 +108,7 @@ impl Renderer {
         Self { config }
     }
 
-    /// Consume the event stream.  Returns when `PipelineComplete` is received
-    /// or the sender is dropped.
+    /// Consume the event stream until `PipelineComplete` or channel close.
     pub async fn run(self, rx: broadcast::Receiver<PipelineEvent>) {
         match self.config.mode {
             OutputMode::Json  => json_run(rx).await,
@@ -106,7 +118,7 @@ impl Renderer {
     }
 }
 
-// ── JSON mode ────────────────────────────────────────────────────────────────
+// ── JSON mode ─────────────────────────────────────────────────────────────────
 
 async fn json_run(mut rx: broadcast::Receiver<PipelineEvent>) {
     loop {
@@ -114,9 +126,7 @@ async fn json_run(mut rx: broadcast::Receiver<PipelineEvent>) {
             Ok(event) => {
                 let json = serde_json::to_string(&event).unwrap_or_default();
                 println!("{json}");
-                if matches!(event, PipelineEvent::PipelineComplete) {
-                    break;
-                }
+                if matches!(event, PipelineEvent::PipelineComplete) { break; }
             }
             Err(_) => break,
         }
@@ -124,20 +134,18 @@ async fn json_run(mut rx: broadcast::Receiver<PipelineEvent>) {
 }
 
 // ── Plain mode ────────────────────────────────────────────────────────────────
-// Buffer all events; print a clean snapshot when done.
 
 async fn plain_run(mut rx: broadcast::Receiver<PipelineEvent>) {
     let mut entries: HashMap<PathBuf, EntryDisplayState> = HashMap::new();
     let mut order: Vec<PathBuf> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     loop {
         match rx.recv().await {
             Ok(event) => {
                 let done = matches!(event, PipelineEvent::PipelineComplete);
-                apply_event(&mut entries, &mut order, event);
-                if done {
-                    break;
-                }
+                apply_event(&mut entries, &mut order, &mut warnings, event);
+                if done { break; }
             }
             Err(_) => break,
         }
@@ -148,13 +156,16 @@ async fn plain_run(mut rx: broadcast::Receiver<PipelineEvent>) {
             print_plain_entry(state);
         }
     }
+
+    // Flush deferred warnings after output.
+    for w in &warnings {
+        eprintln!("{w}");
+    }
 }
 
 fn print_plain_entry(state: &EntryDisplayState) {
     let icon = entry_icon(state);
-    let sub = best_sub_line(state);
-
-    if let Some(sub) = sub {
+    if let Some(sub) = best_sub_line(state) {
         println!("{icon} {}  {sub}", state.basename);
     } else {
         println!("{icon} {}", state.basename);
@@ -166,9 +177,7 @@ fn print_plain_entry(state: &EntryDisplayState) {
 /// A single rendered row (1 or 2 terminal lines).
 #[derive(Clone, PartialEq, Eq)]
 struct RenderedRow {
-    /// Primary line text (no trailing newline).
-    primary: String,
-    /// Optional second line (indented).  `None` = single-line row.
+    primary:   String,
     secondary: Option<String>,
 }
 
@@ -183,94 +192,100 @@ async fn tty_run(
     tick_interval: Option<Duration>,
 ) {
     let mut entries: HashMap<PathBuf, EntryDisplayState> = HashMap::new();
-    let mut order: Vec<PathBuf> = Vec::new();
+    let mut order:   Vec<PathBuf>   = Vec::new();
+    // Warnings deferred until after the grid exits.
+    let mut warnings: Vec<String>   = Vec::new();
 
-    // What we drew last frame, indexed parallel to `order`.
-    // Empty until the first render.
     let mut prev_rows: Vec<RenderedRow> = Vec::new();
-    // Total terminal lines occupied by the last frame.
     let mut prev_line_count: u16 = 0;
 
     let interval = tick_interval.unwrap_or(Duration::from_millis(600));
     let mut ticker = tokio::time::interval(interval);
-    // Burn the first immediate tick so we don't render before any data arrives.
+    // Consume the first instant tick so we don't render before data arrives.
     ticker.tick().await;
 
     let mut pipeline_done = false;
-    let mut dirty = false;
 
-    loop {
-        tokio::select! {
+    'outer: loop {
+        // ── Wait for the next wakeup (event or tick) ──────────────────────────
+        let tick_fired = tokio::select! {
             biased;
-            event = rx.recv() => {
-                match event {
+            result = rx.recv() => {
+                match result {
                     Ok(ev) => {
                         let done = matches!(ev, PipelineEvent::PipelineComplete);
-                        apply_event(&mut entries, &mut order, ev);
-                        dirty = true;
-                        if done {
-                            pipeline_done = true;
-                        }
+                        apply_event(&mut entries, &mut order, &mut warnings, ev);
+                        if done { pipeline_done = true; }
+                        false // tick did not fire
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // We missed some events; re-render whatever state we have.
-                        let _ = n;
-                        dirty = true;
-                    }
-                    Err(_) => {
-                        pipeline_done = true;
-                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => false,
+                    Err(_) => { pipeline_done = true; false }
                 }
             }
-            _ = ticker.tick() => {
-                // Advance each entry's animation frame independently.
-                for path in &order {
-                    if let Some(s) = entries.get_mut(path) {
-                        s.tick_frame();
-                    }
+            _ = ticker.tick() => true,
+        };
+
+        // ── Drain any additional events that arrived in the same burst ────────
+        // This is the key fix: instead of rendering after *every* event, we
+        // consume everything currently in the channel before rendering once.
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    let done = matches!(ev, PipelineEvent::PipelineComplete);
+                    apply_event(&mut entries, &mut order, &mut warnings, ev);
+                    if done { pipeline_done = true; }
                 }
-                dirty = true;
+                Err(broadcast::error::TryRecvError::Empty)   => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => break,
+                Err(broadcast::error::TryRecvError::Closed)  => {
+                    pipeline_done = true;
+                    break;
+                }
             }
         }
 
-        if dirty && !order.is_empty() {
-            retained_render(
-                &entries,
-                &order,
-                &mut prev_rows,
-                &mut prev_line_count,
-            );
-            dirty = false;
+        // ── Advance animation frames on tick ──────────────────────────────────
+        if tick_fired {
+            for path in &order {
+                if let Some(s) = entries.get_mut(path) {
+                    s.tick_frame();
+                }
+            }
+        }
+
+        // ── Render once ───────────────────────────────────────────────────────
+        if !order.is_empty() {
+            retained_render(&entries, &order, &mut prev_rows, &mut prev_line_count);
         }
 
         if pipeline_done {
-            // Final frame: show stable state for everything.
-            retained_render(
-                &entries,
-                &order,
-                &mut prev_rows,
-                &mut prev_line_count,
-            );
-            // Move cursor to a clean new line below the grid.
-            let _ = io::stdout().write_all(b"\n");
-            break;
+            break 'outer;
         }
+    }
+
+    // Final render with fully stable state.
+    if !order.is_empty() {
+        retained_render(&entries, &order, &mut prev_rows, &mut prev_line_count);
+    }
+
+    // Leave cursor on a clean line below the grid.
+    let _ = io::stdout().write_all(b"\n");
+    let _ = io::stdout().flush();
+
+    // Now safe to flush deferred warnings to stderr.
+    for w in &warnings {
+        eprintln!("{w}");
     }
 }
 
-/// Retained-mode redraw.
-///
-/// 1. Compute the new row content for every entry.
-/// 2. Move the cursor back up `prev_line_count` lines (to the top of the grid).
-/// 3. For each row: if content changed, seek to that row and overdraw it;
-///    otherwise skip.
+// ── Retained-mode redraw ──────────────────────────────────────────────────────
+
 fn retained_render(
-    entries: &HashMap<PathBuf, EntryDisplayState>,
-    order: &[PathBuf],
-    prev_rows: &mut Vec<RenderedRow>,
-    prev_line_count: &mut u16,
+    entries:          &HashMap<PathBuf, EntryDisplayState>,
+    order:            &[PathBuf],
+    prev_rows:        &mut Vec<RenderedRow>,
+    prev_line_count:  &mut u16,
 ) {
-    // Build new rows.
     let new_rows: Vec<RenderedRow> = order
         .iter()
         .filter_map(|p| entries.get(p))
@@ -279,7 +294,7 @@ fn retained_render(
 
     let mut stdout = io::stdout();
 
-    // First render: just print everything downward.
+    // ── First paint: print everything downward from current cursor ────────────
     if prev_rows.is_empty() {
         for row in &new_rows {
             let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
@@ -297,23 +312,22 @@ fn retained_render(
         return;
     }
 
-    // Subsequent renders: move cursor to top of grid, then selectively redraw.
+    // ── Subsequent paints: move to top of grid, selectively overdraw ──────────
     let _ = stdout.queue(cursor::MoveToPreviousLine(*prev_line_count));
 
-    let mut new_total_lines: u16 = 0;
+    let mut new_total: u16 = 0;
     let mut prev_iter = prev_rows.iter();
 
-    for row in new_rows.iter() {
-        let prev = prev_iter.next();
+    for row in &new_rows {
+        let prev    = prev_iter.next();
         let changed = prev.map(|r| r != row).unwrap_or(true);
 
         if changed {
-            // Overdraw primary line.
+            // Redraw primary line (clear to EOL first to erase stale content).
             let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
             let _ = stdout.queue(style::Print(&row.primary));
             let _ = stdout.queue(cursor::MoveToNextLine(1));
 
-            // Secondary line.
             match (&row.secondary, prev.and_then(|r| r.secondary.as_ref())) {
                 (Some(sec), _) => {
                     let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
@@ -321,90 +335,74 @@ fn retained_render(
                     let _ = stdout.queue(cursor::MoveToNextLine(1));
                 }
                 (None, Some(_)) => {
-                    // Row shrank from 2 lines to 1: erase the old secondary.
+                    // Row shrank: erase the old secondary line.
                     let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
                     let _ = stdout.queue(cursor::MoveToNextLine(1));
                 }
-                (None, None) => {}
+                (None, None) => { /* single-line row, no change in height */ }
             }
         } else {
-            // Content unchanged: skip over the row's lines.
             let _ = stdout.queue(cursor::MoveToNextLine(row.line_count()));
         }
 
-        new_total_lines += row.line_count();
+        new_total += row.line_count();
     }
 
-    // If the grid shrank (entries removed), erase leftover lines.
-    if new_total_lines < *prev_line_count {
-        let leftover = *prev_line_count - new_total_lines;
+    // Erase any leftover lines if grid shrank.
+    if new_total < *prev_line_count {
+        let leftover = *prev_line_count - new_total;
         for _ in 0..leftover {
             let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
             let _ = stdout.queue(cursor::MoveToNextLine(1));
         }
-        // Move back up to the end of the live grid.
         let _ = stdout.queue(cursor::MoveToPreviousLine(leftover));
     }
 
     let _ = stdout.flush();
-
-    *prev_line_count = new_total_lines;
+    *prev_line_count = new_total;
     *prev_rows = new_rows;
 }
 
 // ── Row rendering ─────────────────────────────────────────────────────────────
 
-/// Render one entry into a `RenderedRow`.
-///
-/// Primary line: `{icon} {name}{status_indicator}`
-/// Secondary line (when available): animated metadata dimension
+/// Build the rendered representation of one entry for the current frame.
 fn render_row(state: &EntryDisplayState) -> RenderedRow {
-    let icon = entry_icon(state);
-
-    // Status indicator (right of name)
-    let status = if state.context_failed {
-        ""           // silent — failure shown only in secondary if desired
-    } else if state.context_pending && state.context.is_none() {
-        " ◌"
-    } else if state.context.is_some() && !state.context_pending {
-        ""           // no clutter on completed rows
-    } else {
-        ""
-    };
-
-    let primary = format!("{icon} {}{status}", state.basename);
+    let icon   = entry_icon(state);
+    let status = status_indicator(state);
+    let primary   = format!("{icon} {}{status}", state.basename);
     let secondary = current_secondary(state);
-
     RenderedRow { primary, secondary }
 }
 
-/// The current metadata sub-line for an entry, based on its animation frame.
+fn status_indicator(state: &EntryDisplayState) -> &'static str {
+    if state.context_pending && state.context.is_none() {
+        " ◌"
+    } else {
+        ""
+    }
+}
+
+/// The animated sub-line for the current frame.
 ///
-/// Dimensions cycle:
-///   0 → (none — name only)
-///   1 → type + size
-///   2 → metrics  (if available)
-///   3 → context  (if available)
+/// Available dimensions (only built when data is present):
+///   1 → type + size  (or "⚠ context unavailable" if context failed)
+///   2 → metrics
+///   3 → context summary
 ///
-/// If a dimension is not yet available, the cycle skips it.
+/// frame 0 = name only (no sub-line)
+/// frame N = dims[N-1]
 fn current_secondary(state: &EntryDisplayState) -> Option<String> {
-    // Build the available dimensions in order.
     let mut dims: Vec<String> = Vec::new();
 
-    // Dim 1: type + size (always show once classified)
+    // Dim 1: type + size
     if let Some(ref cls) = state.classification {
         dims.push(type_line(cls, state.physical.as_ref()));
-    } else if state.context_failed {
-        // Show "context unavailable" only in the sub-line, not as a warning.
-        dims.push("context unavailable".to_string());
     }
 
     // Dim 2: metrics
     if let Some(ref m) = state.metrics {
         let line = metrics_line(m);
-        if !line.is_empty() {
-            dims.push(line);
-        }
+        if !line.is_empty() { dims.push(line); }
     }
 
     // Dim 3: context summary
@@ -412,114 +410,132 @@ fn current_secondary(state: &EntryDisplayState) -> Option<String> {
         dims.push(context_line(ctx));
     }
 
-    if dims.is_empty() {
-        return None;
+    // Context failure visible in dim 1 position if no type either.
+    if dims.is_empty() && state.context_failed {
+        dims.push("⚠ context unavailable".to_string());
     }
 
-    // Pick dimension by frame_index.
-    // frame 0 = no sub-line; frame 1..N = dims[0..N-1]
-    let available_frames = dims.len() + 1; // +1 for the "name only" frame
-    let frame = state.frame_index % available_frames;
-    if frame == 0 {
-        None
-    } else {
-        dims.get(frame - 1).cloned()
-    }
+    if dims.is_empty() { return None; }
+
+    let total_frames = dims.len() + 1; // +1 for name-only frame
+    let frame = state.frame_index % total_frames;
+    if frame == 0 { None } else { dims.get(frame - 1).cloned() }
 }
 
-/// The "best" sub-line for plain/static output — show type+size if available.
 fn best_sub_line(state: &EntryDisplayState) -> Option<String> {
-    if let Some(ref cls) = state.classification {
-        Some(type_line(cls, state.physical.as_ref()))
-    } else {
-        None
-    }
+    state.classification.as_ref()
+        .map(|cls| type_line(cls, state.physical.as_ref()))
 }
 
 fn entry_icon(state: &EntryDisplayState) -> &'static str {
-    state
-        .classification
-        .as_ref()
+    state.classification.as_ref()
         .map(|c| c.semantic_type.icon())
         .unwrap_or(if state.is_dir { "📁" } else { "📄" })
 }
 
-// ── Shared event application ──────────────────────────────────────────────────
+// ── Event application ─────────────────────────────────────────────────────────
 
+/// Mutate `entries`/`order` according to `event`.
+///
+/// Warnings are pushed to `warnings` (not printed) so the live grid is never
+/// contaminated by external content.
 fn apply_event(
-    entries: &mut HashMap<PathBuf, EntryDisplayState>,
-    order: &mut Vec<PathBuf>,
-    event: PipelineEvent,
+    entries:  &mut HashMap<PathBuf, EntryDisplayState>,
+    order:    &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
+    event:    PipelineEvent,
 ) {
     match event {
         PipelineEvent::Discovery(e) => {
-            let path = e.path.clone();
+            let path  = e.path.clone();
             let is_dir = e.kind == EntryKind::Directory;
+            // Guard: never insert the same path twice.
             if !entries.contains_key(&path) {
                 order.push(path.clone());
-                entries.insert(
-                    path,
-                    EntryDisplayState::new(e.path, e.basename, is_dir),
-                );
+                entries.insert(path, EntryDisplayState::new(e.path, e.basename, is_dir));
             }
         }
+
         PipelineEvent::TypeDetected { path, classification } => {
             if let Some(s) = entries.get_mut(&path) {
                 s.classification = Some(classification);
-                s.presentation = s.presentation.advance();
+                s.presentation   = s.presentation.advance();
             }
         }
+
         PipelineEvent::Measured(m) => {
             let path = m.path.clone();
             if let Some(s) = entries.get_mut(&path) {
-                s.physical = Some(m);
+                s.physical     = Some(m);
                 s.presentation = s.presentation.advance();
             }
         }
-        PipelineEvent::Indexed(_) => {}
+
+        PipelineEvent::Indexed(_) => { /* no visible change */ }
+
         PipelineEvent::ContextStarted { path } => {
             if let Some(s) = entries.get_mut(&path) {
                 s.context_pending = true;
                 s.context_failed  = false;
             }
         }
+
         PipelineEvent::ContextUpdated(a) => {
             if let Some(s) = entries.get_mut(&a.path) {
-                s.context = Some(a);
+                s.context         = Some(a);
                 s.context_pending = false;
                 s.context_failed  = false;
-                s.presentation = s.presentation.advance();
+                s.presentation    = s.presentation.advance();
             }
         }
+
         PipelineEvent::MetricsUpdated(m) => {
             let path = m.path.clone();
             if let Some(s) = entries.get_mut(&path) {
-                s.metrics = Some(m);
+                s.metrics      = Some(m);
                 s.presentation = s.presentation.advance();
             }
         }
+
         PipelineEvent::Persisted { path, .. } => {
             if let Some(s) = entries.get_mut(&path) {
                 s.presentation = PresentationState::Stable;
             }
         }
+
         PipelineEvent::Warning { path, message } => {
-            // Context failures mark the entry; verbose detail goes to the
-            // developer log (stderr), which is separated from the TTY display.
-            let is_context_err = message.starts_with("context error:");
-            if let Some(p) = path {
-                if let Some(s) = entries.get_mut(&p) {
-                    if is_context_err {
+            // Mark context failure on the entry; never print during live grid.
+            let is_context = message.starts_with("context error:")
+                || message.starts_with("context unavailable");
+
+            if let Some(ref p) = path {
+                if let Some(s) = entries.get_mut(p) {
+                    if is_context {
                         s.context_pending = false;
                         s.context_failed  = true;
                     }
-                    // Always log to stderr so --output dev can surface it.
-                    eprintln!("[warn] {}: {message}", s.basename);
+                    warnings.push(format!("[warn] {}: {message}", s.basename));
+                } else {
+                    warnings.push(format!("[warn] {message}"));
                 }
             } else {
-                eprintln!("[warn] {message}");
+                warnings.push(format!("[warn] {message}"));
             }
         }
-        PipelineEvent::PipelineComplete => {}
+
+        PipelineEvent::ProviderUnavailable { provider, reason } => {
+            // A single event disabling context for all entries.
+            for s in entries.values_mut() {
+                if s.context_pending {
+                    s.context_pending = false;
+                    s.context_failed  = true;
+                }
+            }
+            warnings.push(format!(
+                "[warn] context provider '{provider}' unavailable: {reason}"
+            ));
+        }
+
+        PipelineEvent::PipelineComplete => { /* handled by caller */ }
     }
 }
