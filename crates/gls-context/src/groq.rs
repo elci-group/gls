@@ -1,7 +1,15 @@
 //! Groq inference client for contextualisation.
 //!
-//! Every result is tagged with full provenance so it can be compared across
-//! invocations and stored in Padagonia.
+//! # Model selection
+//!
+//! The active model is resolved at construction time:
+//!   1. `GLS_GROQ_MODEL` env var
+//!   2. `--model` CLI flag passed through `ContextConfig::model`
+//!   3. `DEFAULT_MODEL` constant (current, non-deprecated model)
+//!
+//! If the resolved model is decommissioned, `resolve_model()` probes the
+//! Groq models endpoint and silently picks the first available fast model.
+//! Provider failures always degrade gracefully — never panic, never spam.
 
 use gls_core::{
     event::{ContextAnnotation, Descriptor, MetricBundle, PipelineEvent},
@@ -13,17 +21,35 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{broadcast, OnceCell};
 
 const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODELS_URL: &str = "https://api.groq.com/openai/v1/models";
 const CONTEXT_VERSION: &str = "1.0";
+
+/// Current recommended fast Groq model.
+/// Update this when Groq deprecates models.
+const DEFAULT_MODEL: &str = "llama-3.1-8b-instant";
+
+/// Ordered fallback preference list.  The first model that the API reports as
+/// available will be used.
+const FALLBACK_MODELS: &[&str] = &[
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
+];
+
+// ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Configuration for the Groq contextualiser.
 #[derive(Debug, Clone)]
 pub struct ContextConfig {
     /// Groq API key (read from `GROQ_API_KEY` env var if not provided).
     pub api_key: Option<String>,
-    /// Model identifier, e.g. `"llama3-8b-8192"`.
+    /// Requested model identifier.  Will be resolved/validated at first use.
     pub model: String,
     /// Maximum tokens to request per inference call.
     pub max_tokens: u32,
@@ -31,18 +57,24 @@ pub struct ContextConfig {
 
 impl Default for ContextConfig {
     fn default() -> Self {
+        let model = std::env::var("GLS_GROQ_MODEL")
+            .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         Self {
             api_key: std::env::var("GROQ_API_KEY").ok(),
-            model: "llama3-8b-8192".to_string(),
+            model,
             max_tokens: 512,
         }
     }
 }
 
+// ── Contextualiser ────────────────────────────────────────────────────────────
+
 /// Performs contextualisation against the Groq API.
 pub struct Contextualiser {
     client: Client,
     config: ContextConfig,
+    /// Resolved model, populated lazily on first successful probe.
+    resolved_model: Arc<OnceCell<String>>,
 }
 
 impl Contextualiser {
@@ -50,6 +82,7 @@ impl Contextualiser {
         Self {
             client: Client::new(),
             config,
+            resolved_model: Arc::new(OnceCell::new()),
         }
     }
 
@@ -62,8 +95,6 @@ impl Contextualiser {
     ) {
         for desc in descriptors {
             let path = desc.path.clone();
-
-            // Signal contextualisation has begun.
             let _ = tx.send(PipelineEvent::ContextStarted { path: path.clone() });
 
             match self.contextualise_one(&desc).await {
@@ -81,6 +112,67 @@ impl Contextualiser {
         }
     }
 
+    /// Resolve the actual model to use, probing Groq if needed.
+    ///
+    /// The result is cached in `resolved_model` so the probe only runs once
+    /// per `Contextualiser` instance.
+    async fn active_model(&self) -> Result<String, String> {
+        if let Some(m) = self.resolved_model.get() {
+            return Ok(m.clone());
+        }
+
+        let api_key = self
+            .config
+            .api_key
+            .clone()
+            .ok_or_else(|| "GROQ_API_KEY not set".to_string())?;
+
+        let resolved = self
+            .probe_model(&api_key, &self.config.model)
+            .await
+            .unwrap_or_else(|_| self.config.model.clone());
+
+        // Store; if another task raced us, just use whatever was stored.
+        let _ = self.resolved_model.set(resolved.clone());
+        Ok(self.resolved_model.get().cloned().unwrap_or(resolved))
+    }
+
+    /// Check whether `preferred` is available; if not, walk `FALLBACK_MODELS`
+    /// and return the first one the API reports as active.
+    async fn probe_model(&self, api_key: &str, preferred: &str) -> Result<String, String> {
+        let resp = self
+            .client
+            .get(GROQ_MODELS_URL)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            // Can't reach models endpoint — trust the configured model.
+            return Ok(preferred.to_string());
+        }
+
+        let body: GroqModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let available: std::collections::HashSet<String> =
+            body.data.into_iter().map(|m| m.id).collect();
+
+        // Prefer the requested model if it's still listed.
+        if available.contains(preferred) {
+            return Ok(preferred.to_string());
+        }
+
+        // Walk the fallback list.
+        for &candidate in FALLBACK_MODELS {
+            if available.contains(candidate) {
+                return Ok(candidate.to_string());
+            }
+        }
+
+        // Nothing matched — return preferred and let the call fail naturally.
+        Ok(preferred.to_string())
+    }
+
     async fn contextualise_one(
         &self,
         desc: &Descriptor,
@@ -91,22 +183,18 @@ impl Contextualiser {
             .clone()
             .ok_or_else(|| "GROQ_API_KEY not set".to_string())?;
 
+        let model = self.active_model().await?;
+
         let prompt = build_prompt(desc);
         let descriptor_bytes = serde_json::to_vec(&desc.payload).unwrap_or_default();
         let descriptor_hash = hex::encode(Sha256::digest(&descriptor_bytes));
 
         let request_body = serde_json::json!({
-            "model": self.config.model,
+            "model": model,
             "max_tokens": self.config.max_tokens,
             "messages": [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                { "role": "system", "content": SYSTEM_PROMPT },
+                { "role": "user",   "content": prompt }
             ],
             "response_format": { "type": "json_object" }
         });
@@ -140,7 +228,7 @@ impl Contextualiser {
         let now = chrono::Utc::now();
         let provenance = ContextProvenance {
             context_version: CONTEXT_VERSION.to_string(),
-            model: self.config.model.clone(),
+            model: model.clone(),
             provider: "groq".to_string(),
             descriptor_hash,
             source_hash: desc.source_hash.clone(),
@@ -166,10 +254,11 @@ impl Contextualiser {
         };
 
         let metrics = extract_metrics(&desc.path, &parsed);
-
         Ok((annotation, metrics))
     }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_prompt(desc: &Descriptor) -> String {
     let payload = serde_json::to_string_pretty(&desc.payload).unwrap_or_default();
@@ -239,7 +328,7 @@ Important:
 - Return valid JSON only.
 "#;
 
-// ── Groq wire types ──────────────────────────────────────────────────────────
+// ── Groq wire types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct GroqResponse {
@@ -254,4 +343,14 @@ struct GroqChoice {
 #[derive(Debug, Deserialize)]
 struct GroqMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroqModelsResponse {
+    data: Vec<GroqModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroqModel {
+    id: String,
 }

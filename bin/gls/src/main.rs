@@ -4,12 +4,11 @@
 //! # Pipeline
 //!
 //! ```text
-//! DISCOVER → TYPE → BART → INDEX → BOUND → CONTEXT → METRICS
+//! DISCOVER → [TYPE ∥ BART] → INDEX → BOUND → CONTEXT → METRICS
 //! ```
 //!
-//! Each phase emits [`PipelineEvent`] values onto a broadcast channel.
-//! The renderer and the Padagonia persistence layer each consume an independent
-//! clone of the same stream.
+//! Discovery events are emitted immediately so names appear at T0.
+//! TYPE and BART run concurrently.  INDEX and CONTEXT follow after.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +17,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use gls_bart::measure_entry;
 use gls_bound::{select_candidates, Bound};
 use gls_context::{ContextConfig, Contextualiser};
+use gls_core::entry::FsEntry;
 use gls_core::event::PipelineEvent;
 use gls_core::pipeline;
 use gls_discover::DiscoverConfig;
@@ -76,8 +76,9 @@ struct Cli {
     output: OutputArg,
 
     /// Groq model to use for contextualisation.
-    #[arg(long, default_value = "llama3-8b-8192")]
-    model: String,
+    /// Defaults to the GLS_GROQ_MODEL env var, then the current recommended model.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -98,7 +99,7 @@ enum OutputArg {
 async fn main() {
     let cli = Cli::parse();
 
-    // ── Bound configuration ───────────────────────────────────────────────────
+    // ── Bound ─────────────────────────────────────────────────────────────────
     let bound = Bound {
         depth: if cli.deep { cli.depth.max(3) } else { cli.depth },
         no_context: cli.no_context,
@@ -108,11 +109,11 @@ async fn main() {
         ..Default::default()
     };
 
-    // ── Pipeline broadcast channel ────────────────────────────────────────────
+    // ── Pipeline broadcast channel ─────────────────────────────────────────────
     let (tx, rx_render) = pipeline::channel();
     let rx_padagonia = tx.subscribe();
 
-    // ── Renderer output mode ──────────────────────────────────────────────────
+    // ── Renderer output mode ───────────────────────────────────────────────────
     let output_mode = match cli.output {
         OutputArg::Json  => OutputMode::Json,
         OutputArg::Plain => OutputMode::Plain,
@@ -132,7 +133,7 @@ async fn main() {
     {
         None
     } else {
-        Some(Duration::from_millis(800))
+        Some(Duration::from_millis(600))
     };
 
     let render_config = RenderConfig {
@@ -140,7 +141,7 @@ async fn main() {
         tick_interval: tick,
     };
 
-    // ── Padagonia ─────────────────────────────────────────────────────────────
+    // ── Padagonia ──────────────────────────────────────────────────────────────
     let padagonia = Padagonia::open(&PadagoniaConfig::default())
         .unwrap_or_else(|e| {
             eprintln!("[warn] padagonia unavailable: {e}");
@@ -150,75 +151,43 @@ async fn main() {
             .expect("in-memory SQLite must always work")
         });
 
-    // ── Spawn renderer and Padagonia consumer ─────────────────────────────────
+    // ── Spawn renderer and Padagonia consumer ──────────────────────────────────
     let renderer = Renderer::new(render_config);
-    let render_task = tokio::spawn(async move { renderer.run(rx_render).await });
-    let padagonia_task =
-        tokio::spawn(async move { padagonia.consume_stream(rx_padagonia).await });
+    let render_task    = tokio::spawn(async move { renderer.run(rx_render).await });
+    let padagonia_task = tokio::spawn(async move { padagonia.consume_stream(rx_padagonia).await });
 
-    // ── DISCOVER ──────────────────────────────────────────────────────────────
+    // ── DISCOVER ───────────────────────────────────────────────────────────────
+    // Collect entries on a private channel first (we need the Vec for later
+    // phases), then immediately forward Discovery events to the main channel
+    // so the renderer shows names at T0.
     let target = cli.target.canonicalize().unwrap_or(cli.target.clone());
 
-    let discover_cfg = DiscoverConfig {
-        max_depth: bound.depth,
-        follow_links: false,
-        include_hidden: cli.hidden,
-    };
+    let entries = collect_discovered(&target, &bound, cli.hidden).await;
 
-    // Collect entries via a private channel first so we can use them for
-    // subsequent phases, then replay Discovery events on the main channel.
-    let (tx_collect, mut rx_collect) =
-        tokio::sync::broadcast::channel::<PipelineEvent>(1024);
-    gls_discover::discover(target.clone(), discover_cfg.clone(), tx_collect.clone()).await;
-    drop(tx_collect);
-
-    let mut entries = Vec::new();
-    loop {
-        match rx_collect.recv().await {
-            Ok(PipelineEvent::Discovery(e)) => entries.push(e),
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-
-    // Emit Discovery events to the main broadcast channel (for the renderer).
+    // T0: emit names immediately.
     for entry in &entries {
         let _ = tx.send(PipelineEvent::Discovery(entry.clone()));
     }
 
-    // ── TYPE ──────────────────────────────────────────────────────────────────
-    classify_entry(entries.clone(), tx.clone()).await;
+    // ── TYPE ∥ BART ────────────────────────────────────────────────────────────
+    // Run classification and physical measurement concurrently.
+    let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
 
-    // ── BART ──────────────────────────────────────────────────────────────────
-    let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
-    measure_entry(paths, tx.clone()).await;
+    let tx_type = tx.clone();
+    let tx_bart = tx.clone();
+    let entries_clone = entries.clone();
 
-    // ── INDEX ─────────────────────────────────────────────────────────────────
-    // Build descriptors via a private channel so we can collect them for BOUND.
-    let (tx_idx, mut rx_idx) = tokio::sync::broadcast::channel::<PipelineEvent>(1024);
-    let index_items: Vec<_> = entries
-        .iter()
-        .map(|e| (e.path.clone(), None, None))
-        .collect();
-    build_descriptor(index_items, tx_idx.clone()).await;
-    drop(tx_idx);
+    let ((), ()) = tokio::join!(
+        async move { classify_entry(entries_clone, tx_type).await },
+        async move { measure_entry(paths,           tx_bart).await },
+    );
 
-    let mut descriptors = Vec::new();
-    loop {
-        match rx_idx.recv().await {
-            Ok(PipelineEvent::Indexed(d)) => {
-                // Emit to main channel so renderer can track indexing.
-                let _ = tx.send(PipelineEvent::Indexed(d.clone()));
-                descriptors.push(d);
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
+    // ── INDEX ──────────────────────────────────────────────────────────────────
+    // Build descriptors privately; forward Indexed events to the main channel.
+    let descriptors = collect_descriptors(&entries, tx.clone()).await;
 
-    // ── CONTEXT ───────────────────────────────────────────────────────────────
+    // ── CONTEXT ────────────────────────────────────────────────────────────────
     if !bound.no_context {
-        // BOUND: select candidates within budget.
         let weighted: Vec<_> = descriptors
             .into_iter()
             .map(|d| {
@@ -231,17 +200,72 @@ async fn main() {
 
         let candidates = select_candidates(weighted, &bound);
 
-        let ctx_config = ContextConfig {
-            model: cli.model.clone(),
-            ..Default::default()
-        };
+        let mut ctx_config = ContextConfig::default();
+        if let Some(ref m) = cli.model {
+            ctx_config.model = m.clone();
+        }
+
         let contextualiser = Contextualiser::new(ctx_config);
         contextualiser.contextualise(candidates, tx.clone()).await;
     }
 
-    // ── Signal completion ─────────────────────────────────────────────────────
+    // ── Done ───────────────────────────────────────────────────────────────────
     let _ = tx.send(PipelineEvent::PipelineComplete);
-
-    // ── Wait for renderer and Padagonia to finish ─────────────────────────────
     let _ = tokio::join!(render_task, padagonia_task);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Discover filesystem entries via a private channel, returning them as a Vec.
+async fn collect_discovered(
+    target: &PathBuf,
+    bound: &Bound,
+    include_hidden: bool,
+) -> Vec<FsEntry> {
+    let (tx2, mut rx2) = tokio::sync::broadcast::channel::<PipelineEvent>(1024);
+    let cfg = DiscoverConfig {
+        max_depth: bound.depth,
+        follow_links: false,
+        include_hidden,
+    };
+    gls_discover::discover(target.clone(), cfg, tx2.clone()).await;
+    drop(tx2);
+
+    let mut entries = Vec::new();
+    loop {
+        match rx2.recv().await {
+            Ok(PipelineEvent::Discovery(e)) => entries.push(e),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    entries
+}
+
+/// Build descriptors for every entry, emit Indexed events on `tx`, and return
+/// the descriptors for use by the CONTEXT phase.
+async fn collect_descriptors(
+    entries: &[FsEntry],
+    tx: tokio::sync::broadcast::Sender<PipelineEvent>,
+) -> Vec<gls_index::Descriptor> {
+    let (tx_idx, mut rx_idx) = tokio::sync::broadcast::channel::<PipelineEvent>(1024);
+    let items: Vec<_> = entries
+        .iter()
+        .map(|e| (e.path.clone(), None, None))
+        .collect();
+    build_descriptor(items, tx_idx.clone()).await;
+    drop(tx_idx);
+
+    let mut descriptors = Vec::new();
+    loop {
+        match rx_idx.recv().await {
+            Ok(PipelineEvent::Indexed(d)) => {
+                let _ = tx.send(PipelineEvent::Indexed(d.clone()));
+                descriptors.push(d);
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    descriptors
 }

@@ -20,8 +20,11 @@ pub struct EntryDisplayState {
     pub presentation: PresentationState,
     /// Which animation frame (dimension) is currently shown.
     pub frame_index: usize,
-    /// True once a ContextStarted event has been received.
+    /// True while a ContextStarted has been received but no result yet.
     pub context_pending: bool,
+    /// True if contextualisation failed (provider error, etc.).
+    /// The failure is shown silently in the sub-line; no stderr spam.
+    pub context_failed: bool,
 }
 
 impl EntryDisplayState {
@@ -37,24 +40,22 @@ impl EntryDisplayState {
             presentation: PresentationState::Discovered,
             frame_index: 0,
             context_pending: false,
+            context_failed: false,
         }
     }
 
-    /// Number of animated dimensions currently available.
-    pub fn available_frames(&self) -> usize {
-        let mut n = 1; // always at least the name
-        if self.classification.is_some() { n += 1; }
-        if self.physical.is_some()       { n += 1; }
-        if self.context.is_some()        { n += 1; }
-        if self.metrics.is_some()        { n += 1; }
-        n
-    }
-
-    /// Advance to the next animation frame.
+    /// Advance to the next animation frame independently of pipeline state.
     pub fn tick_frame(&mut self) {
-        let frames = self.available_frames();
-        if frames > 0 {
-            self.frame_index = (self.frame_index + 1) % frames;
+        // Frame count: 1 (name-only) + one per available metadata dimension.
+        // Compute the same way current_secondary does in the renderer.
+        let mut dim_count = 0usize;
+        if self.classification.is_some() || self.context_failed { dim_count += 1; }
+        if self.metrics.is_some() { dim_count += 1; }
+        if self.context.is_some() { dim_count += 1; }
+
+        let total_frames = dim_count + 1; // +1 for the name-only frame
+        if total_frames > 1 {
+            self.frame_index = (self.frame_index + 1) % total_frames;
         }
     }
 }
