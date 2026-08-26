@@ -236,15 +236,21 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
     let mut prev_line_count: u16 = 0;
 
     let interval = tick_interval.unwrap_or(Duration::from_millis(600));
-    let mut ticker = tokio::time::interval(interval);
-    // Consume the first instant tick so we don't render before data arrives.
-    ticker.tick().await;
+    // Tracked as a wall-clock deadline rather than a `tokio::time::Interval`
+    // raced inside `select!`. TYPE/BART/context events for a real directory
+    // keep arriving back-to-back, which keeps `rx.recv()` ready on almost
+    // every poll — with `biased` select preferring that branch, an
+    // interval future raced against it would starve and never fire, so the
+    // spinner would appear to freeze even though results keep streaming in.
+    // `select!` below only decides *when we wake up*; whether a frame
+    // actually advances is decided afterwards purely by elapsed time.
+    let mut next_tick = tokio::time::Instant::now() + interval;
 
     let mut pipeline_done = false;
 
     'outer: loop {
-        // ── Wait for the next wakeup (event or tick) ──────────────────────────
-        let tick_fired = tokio::select! {
+        // ── Wait for the next wakeup (event or tick deadline) ─────────────────
+        tokio::select! {
             biased;
             result = rx.recv() => {
                 match result {
@@ -252,13 +258,12 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                         let done = matches!(ev, PipelineEvent::PipelineComplete);
                         apply_event(&mut entries, &mut order, &mut warnings, &mut queue, ev);
                         if done { pipeline_done = true; }
-                        false // tick did not fire
                     }
-                    None => { pipeline_done = true; false }
+                    None => { pipeline_done = true; }
                 }
             }
-            _ = ticker.tick() => true,
-        };
+            _ = tokio::time::sleep_until(next_tick) => {}
+        }
 
         // ── Drain any additional events that arrived in the same burst ────────
         // This is the key fix: instead of rendering after *every* event, we
@@ -283,16 +288,21 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
             }
         }
 
-        // ── Advance animation frames on tick ──────────────────────────────────
-        // Purely cosmetic now (which spinner glyph to show for still-pending
-        // work) — it no longer gates *which* completed sub-result is
-        // visible, since those are all shown the instant they arrive.
-        if tick_fired {
+        // ── Advance animation frames once the deadline has actually passed ────
+        // Checked by wall clock, independent of which `select!` branch woke
+        // us — otherwise a busy event stream would win that race every time
+        // and the "thinking" spinner would never move. Purely cosmetic
+        // (which spinner glyph to show for still-pending work) — it no
+        // longer gates *which* completed sub-result is visible, since those
+        // are all shown the instant they arrive.
+        let now = tokio::time::Instant::now();
+        if now >= next_tick {
             for path in &order {
                 if let Some(s) = entries.get_mut(path) {
                     s.tick_frame();
                 }
             }
+            next_tick = now + interval;
         }
 
         // ── Render once ───────────────────────────────────────────────────────

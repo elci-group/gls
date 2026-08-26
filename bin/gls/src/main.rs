@@ -372,10 +372,10 @@ async fn main() {
 fn sort_entries(entries: &mut [FsEntry], order: SortOrder) {
     match order {
         SortOrder::Name => {
-            entries.sort_by(|a, b| a.basename.to_lowercase().cmp(&b.basename.to_lowercase()));
+            entries.sort_by_key(|entry| entry.basename.to_lowercase());
         }
         SortOrder::Size => {
-            entries.sort_by(|a, b| b.logical_bytes.cmp(&a.logical_bytes));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.logical_bytes));
         }
         SortOrder::Type => {
             // Stable sort: alphabetical within each kind bucket.
@@ -387,7 +387,7 @@ fn sort_entries(entries: &mut [FsEntry], order: SortOrder) {
             });
         }
         SortOrder::Modified => {
-            entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
         }
     }
 }
@@ -428,7 +428,7 @@ fn run_history(path: &Path, limit: Option<usize>) {
     };
 
     println!("History for: {}", canonical.display());
-    println!("{:<38}  {}", "revision", "timestamp");
+    println!("{:<38}  timestamp", "revision");
     println!("{}", "-".repeat(60));
     for (rev, ts) in &revisions {
         println!("{rev}  {ts}");
