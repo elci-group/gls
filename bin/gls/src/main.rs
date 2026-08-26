@@ -261,8 +261,7 @@ async fn main() {
         follow_links: false,
         include_hidden: cli.hidden,
     };
-    let mut entries =
-        gls_discover::discover(target.clone(), discover_config, tx.clone()).await;
+    let mut entries = gls_discover::discover(target.clone(), discover_config, tx.clone()).await;
 
     // ── SORT ───────────────────────────────────────────────────────────────────
     sort_entries(&mut entries, cli.sort);
@@ -278,10 +277,7 @@ async fn main() {
         .iter()
         .map(|entry| {
             let entry_depth = entry.relative.components().count();
-            (
-                entry.path.clone(),
-                bound.depth.saturating_sub(entry_depth),
-            )
+            (entry.path.clone(), bound.depth.saturating_sub(entry_depth))
         })
         .collect();
 
@@ -320,8 +316,7 @@ async fn main() {
             )
         })
         .collect();
-    let descriptors =
-        build_descriptor(descriptor_items, bound.excerpt_bytes, tx.clone()).await;
+    let descriptors = build_descriptor(descriptor_items, bound.excerpt_bytes, tx.clone()).await;
 
     // ── CONTEXT ────────────────────────────────────────────────────────────────
     if !bound.no_context {
@@ -332,8 +327,7 @@ async fn main() {
                 classifications
                     .get(&d.path)
                     .map(|classification| {
-                        classification.semantic_type
-                            != gls_core::semantic::SemanticType::Credential
+                        classification.semantic_type != gls_core::semantic::SemanticType::Credential
                     })
                     .unwrap_or(true)
             })

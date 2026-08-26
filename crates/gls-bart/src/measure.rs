@@ -377,6 +377,18 @@ mod tests {
         // Root + sub1 + sub2 + sub3, all captured.
         assert_eq!(result.aggregates.len(), 4);
     }
+
+    #[test]
+    fn recursive_measurement_respects_the_requested_depth() {
+        let dir = build_tree();
+        let shallow = measure_dir(dir.path(), 1);
+        let deep = measure_dir(dir.path(), 2);
+
+        assert_eq!(shallow.measure.tree_bytes, Some(10));
+        assert_eq!(shallow.measure.object_count, Some(2));
+        assert_eq!(deep.measure.tree_bytes, Some(30));
+        assert_eq!(deep.measure.object_count, Some(4));
+    }
 }
 
 /// Minimal self-contained temp-directory helper (no external crate needed

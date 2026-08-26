@@ -4,12 +4,12 @@
 //! than reading the raw file.  It captures structural signals, excerpts, and
 //! hashes.
 
+use gls_core::semantic::Classification;
+use gls_core::semantic::SemanticType;
 use gls_core::{
     event::{Descriptor, PhysicalMeasure, PipelineEvent},
     pipeline::PipelineSender,
 };
-use gls_core::semantic::Classification;
-use gls_core::semantic::SemanticType;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -24,9 +24,7 @@ pub async fn build_descriptor(
     let results = tokio::task::spawn_blocking(move || {
         items
             .into_iter()
-            .map(|(path, cls, meas)| {
-                build_one(&path, cls.as_ref(), meas.as_ref(), excerpt_bytes)
-            })
+            .map(|(path, cls, meas)| build_one(&path, cls.as_ref(), meas.as_ref(), excerpt_bytes))
             .collect::<Vec<_>>()
     })
     .await
@@ -134,5 +132,59 @@ fn extract_excerpt(path: &Path, max_bytes: usize) -> Option<Vec<String>> {
         None
     } else {
         Some(lines)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gls_core::semantic::Classification;
+
+    #[test]
+    fn excerpt_never_reads_past_the_configured_prefix() {
+        let file = ScratchFile::new(&vec![b'x'; 32 * 1024]);
+        let excerpt = extract_excerpt(file.path(), 128).unwrap();
+        assert_eq!(excerpt.concat().len(), 128);
+    }
+
+    #[test]
+    fn credential_descriptors_never_contain_excerpts() {
+        let file = ScratchFile::new(b"API_TOKEN=do-not-send");
+        let classification = Classification {
+            semantic_type: SemanticType::Credential,
+            confidence: 1.0,
+            evidence: Vec::new(),
+            language: None,
+        };
+        let descriptor = build_one(file.path(), Some(&classification), None, 8_192);
+        assert!(descriptor.payload["excerpt"].is_null());
+    }
+
+    struct ScratchFile(PathBuf);
+
+    impl ScratchFile {
+        fn new(contents: &[u8]) -> Self {
+            let unique = format!(
+                "gls-index-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }

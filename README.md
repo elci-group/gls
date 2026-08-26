@@ -38,7 +38,7 @@ The effect: **looking through a glass that gradually comes into focus.**
 ## Pipeline
 
 ```text
-DISCOVER → TYPE → BART → INDEX → BOUND → CONTEXT → METRICS
+DISCOVER → [TYPE ∥ BART] → INDEX → BOUND → CONTEXT + METRICS
 ```
 
 | Phase    | Description |
@@ -48,8 +48,8 @@ DISCOVER → TYPE → BART → INDEX → BOUND → CONTEXT → METRICS
 | BART     | Physical/storage analysis: size, entropy, reclaimable space |
 | INDEX    | Compact descriptor generation for inference |
 | BOUND    | Scope and inference-budget control |
-| CONTEXT  | Groq-backed semantic contextualisation |
-| METRICS  | Structured completeness / quality / accuracy metrics |
+| CONTEXT  | Optional Groq-backed semantic contextualisation |
+| METRICS  | Structured values returned with contextualisation |
 
 All phases emit `PipelineEvent` values onto a broadcast channel.
 The renderer and the Padagonia persistence layer each consume an independent
@@ -66,11 +66,11 @@ gls
 # Inspect a specific path
 gls src/
 
-# Deep scan with full contextualisation
+# Deep deterministic scan
 gls --deep .
 
-# No AI contextualisation (fast, deterministic only)
-gls --no-context .
+# Explicitly enable remote contextualisation
+gls --context .
 
 # Machine-readable JSON output
 gls --output json .
@@ -78,8 +78,9 @@ gls --output json .
 # Plain text (no animation)
 gls --no-animate .
 
-# History mode
-gls --history .
+# History and persisted size information
+gls history .
+gls size .
 ```
 
 ---
@@ -112,7 +113,8 @@ renderer  Padagonia
 | `gls-index` | INDEX phase — compact descriptor generation |
 | `gls-bound` | BOUND phase — scope and budget control |
 | `gls-context` | CONTEXT phase — Groq semantic contextualisation |
-| `gls-metrics` | METRICS phase — structured metric objects |
+| `gls-metrics` | Metric aggregation helpers |
+| `gls-provider` | Provider catalogue, model polling, and cached selection |
 | `gls-padagonia` | Persistent contextual history (SQLite) |
 | `gls-render` | Animation engine and 3form renderer |
 | `bin/gls` | CLI binary |
@@ -151,6 +153,10 @@ Expensive stages happen *after* useful output has already appeared.
 Padagonia makes subsequent executions increasingly intelligent rather than
 increasingly expensive.
 
+Remote contextualisation is opt-in with `--context`. GLS never sends files
+classified as credentials, and descriptor excerpts are bounded to 8 KiB.
+Hidden directories are pruned unless `--hidden` is supplied.
+
 ---
 
 ## Building
@@ -167,7 +173,7 @@ The binary is at `target/release/gls`.
 
 | Variable | Purpose |
 |----------|---------|
-| `GROQ_API_KEY` | Groq API key for contextualisation (optional; disables CONTEXT phase if absent) |
+| `GROQ_API_KEY` | Groq API key used only when `--context` is supplied |
 
 ---
 

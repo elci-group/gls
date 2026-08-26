@@ -100,7 +100,9 @@ impl QueueTracker {
         // turn for each item strictly ahead of this one, then this item's
         // own turn.
         let remaining_current = (avg - self.current_elapsed_secs()).max(0.0);
-        let eta_secs = (remaining_current + ahead as f64 * avg + avg).round().max(0.0) as u64;
+        let eta_secs = (remaining_current + ahead as f64 * avg + avg)
+            .round()
+            .max(0.0) as u64;
         Some(QueueStatus {
             position: ahead + 1,
             total: self.total,

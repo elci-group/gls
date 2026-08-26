@@ -55,9 +55,7 @@ impl PipelineReceiver {
         self.receiver.recv().await
     }
 
-    pub fn try_recv(
-        &mut self,
-    ) -> Result<crate::event::PipelineEvent, mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<crate::event::PipelineEvent, mpsc::error::TryRecvError> {
         self.receiver.try_recv()
     }
 }
@@ -129,5 +127,32 @@ impl PresentationState {
             Self::Valuated => Self::Stable,
             Self::Stable => Self::Stable,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::PipelineEvent;
+
+    #[tokio::test]
+    async fn fanout_does_not_drop_bursts_above_the_old_capacity() {
+        let (sender, mut first) = channel();
+        let mut second = sender.subscribe();
+        for _ in 0..2_048 {
+            assert_eq!(sender.send(PipelineEvent::PipelineComplete), 2);
+        }
+        drop(sender);
+
+        let mut first_count = 0;
+        while first.recv().await.is_some() {
+            first_count += 1;
+        }
+        let mut second_count = 0;
+        while second.recv().await.is_some() {
+            second_count += 1;
+        }
+        assert_eq!(first_count, 2_048);
+        assert_eq!(second_count, 2_048);
     }
 }

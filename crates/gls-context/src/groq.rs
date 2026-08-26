@@ -98,11 +98,7 @@ impl Contextualiser {
     /// Calls `preflight()` first.  If the provider is unavailable, emits a
     /// single `ProviderUnavailable` event and returns without processing any
     /// objects.  Individual per-object failures emit `Warning` events.
-    pub async fn contextualise(
-        &self,
-        descriptors: Vec<Descriptor>,
-        tx: PipelineSender,
-    ) {
+    pub async fn contextualise(&self, descriptors: Vec<Descriptor>, tx: PipelineSender) {
         // ── Pre-flight ────────────────────────────────────────────────────────
         if let Err(reason) = self.preflight().await {
             let _ = tx.send(PipelineEvent::ProviderUnavailable {

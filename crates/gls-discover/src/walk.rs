@@ -36,11 +36,7 @@ impl Default for DiscoverConfig {
 ///
 /// Runs the blocking walkdir call on a Tokio blocking thread so the async
 /// runtime is never stalled.
-pub async fn discover(
-    root: PathBuf,
-    config: DiscoverConfig,
-    tx: PipelineSender,
-) -> Vec<FsEntry> {
+pub async fn discover(root: PathBuf, config: DiscoverConfig, tx: PipelineSender) -> Vec<FsEntry> {
     let root_clone = root.clone();
     tokio::task::spawn_blocking(move || collect_entries(&root_clone, &config, &tx))
         .await
@@ -143,4 +139,60 @@ fn collect_entries(root: &Path, config: &DiscoverConfig, tx: &PipelineSender) ->
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gls_core::pipeline;
+
+    #[test]
+    fn hidden_directories_are_pruned_from_the_walk() {
+        let root = ScratchDir::new();
+        std::fs::create_dir(root.path().join(".hidden")).unwrap();
+        std::fs::write(root.path().join(".hidden/visible.txt"), b"secret").unwrap();
+        std::fs::write(root.path().join("public.txt"), b"public").unwrap();
+        let (sender, _receiver) = pipeline::channel();
+
+        let entries = collect_entries(
+            root.path(),
+            &DiscoverConfig {
+                max_depth: 2,
+                follow_links: false,
+                include_hidden: false,
+            },
+            &sender,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].basename, "public.txt");
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let unique = format!(
+                "gls-discover-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }

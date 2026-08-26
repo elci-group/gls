@@ -147,7 +147,9 @@ impl Renderer {
 async fn json_run(mut rx: PipelineReceiver) {
     while let Some(event) = rx.recv().await {
         let json = serde_json::to_string(&event).unwrap_or_default();
-        println!("{json}");
+        if writeln!(io::stdout(), "{json}").is_err() {
+            break;
+        }
         if matches!(event, PipelineEvent::PipelineComplete) {
             break;
         }
@@ -174,14 +176,16 @@ async fn plain_run(mut rx: PipelineReceiver, grid: bool) {
         // By the time this prints, the pipeline has already completed, so
         // there's never anything left to queue — this is purely a settled
         // snapshot, same as the non-grid branch below.
-        print!(
-            "{}",
-            crate::grid::render_grid(&entries, &order, &queue, terminal_width(), false)
-        );
+        let rendered = crate::grid::render_grid(&entries, &order, &queue, terminal_width(), false);
+        let _ = io::stdout().write_all(rendered.as_bytes());
     } else {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
         for path in &order {
             if let Some(state) = entries.get(path) {
-                print_plain_entry(state);
+                if print_plain_entry(&mut output, state).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -192,12 +196,12 @@ async fn plain_run(mut rx: PipelineReceiver, grid: bool) {
     }
 }
 
-fn print_plain_entry(state: &EntryDisplayState) {
+fn print_plain_entry(output: &mut impl Write, state: &EntryDisplayState) -> io::Result<()> {
     let icon = entry_icon(state);
     if let Some(sub) = best_sub_line_plain(state) {
-        println!("{icon} {}  {sub}", state.basename);
+        writeln!(output, "{icon} {}  {sub}", state.basename)
     } else {
-        println!("{icon} {}", state.basename);
+        writeln!(output, "{icon} {}", state.basename)
     }
 }
 
@@ -220,11 +224,7 @@ impl RenderedRow {
     }
 }
 
-async fn tty_run(
-    mut rx: PipelineReceiver,
-    tick_interval: Option<Duration>,
-    grid: bool,
-) {
+async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid: bool) {
     let mut entries: HashMap<PathBuf, EntryDisplayState> = HashMap::new();
     let mut order: Vec<PathBuf> = Vec::new();
     // Warnings deferred until after the grid exits.

@@ -46,7 +46,10 @@ impl fmt::Display for PollError {
 
 /// Poll `provider`'s real model-listing endpoint. Returns every model it
 /// reports, each carrying a heuristic [`efficiency_score`].
-pub async fn poll_models(client: &Client, provider: &Provider) -> Result<Vec<ModelInfo>, PollError> {
+pub async fn poll_models(
+    client: &Client,
+    provider: &Provider,
+) -> Result<Vec<ModelInfo>, PollError> {
     match provider.kind {
         ProviderKind::Unsupported { reason } => Err(PollError::Unsupported(reason)),
         ProviderKind::OpenAiCompatible { base } => {
@@ -69,7 +72,11 @@ pub async fn poll_models(client: &Client, provider: &Provider) -> Result<Vec<Mod
             let key = api_key(provider)?;
             let url = format!("{base}/v1/models");
             let list: CohereModelList = get_json(client, &url, |r| r.bearer_auth(&key)).await?;
-            Ok(list.models.into_iter().map(|m| model_info(m.name)).collect())
+            Ok(list
+                .models
+                .into_iter()
+                .map(|m| model_info(m.name))
+                .collect())
         }
     }
 }
@@ -100,7 +107,10 @@ async fn get_json<T: serde::de::DeserializeOwned>(
 
 fn model_info(id: String) -> ModelInfo {
     let efficiency_score = efficiency_score(&id);
-    ModelInfo { id, efficiency_score }
+    ModelInfo {
+        id,
+        efficiency_score,
+    }
 }
 
 /// Heuristic 0.0–1.0 "inference-efficient" score derived from naming
