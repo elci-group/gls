@@ -235,6 +235,10 @@ impl Contextualiser {
         &self,
         desc: &Descriptor,
     ) -> Result<(ContextAnnotation, MetricBundle), String> {
+        // TEMP DEBUG: simulate multi-second real-world API latency without hitting the network.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        return Err("TEMP DEBUG simulated latency".to_string());
+        #[allow(unreachable_code)]
         let api_key = self
             .config
             .api_key
