@@ -90,8 +90,6 @@ impl Contextualiser {
     /// Returns `Ok(model_name)` on success, or `Err(reason)` if the provider
     /// should be considered unavailable for this run.
     pub async fn preflight(&self) -> Result<String, String> {
-        return Ok("TEMP DEBUG mock model".to_string());
-        #[allow(unreachable_code)]
         self.active_model().await
     }
 
@@ -237,10 +235,6 @@ impl Contextualiser {
         &self,
         desc: &Descriptor,
     ) -> Result<(ContextAnnotation, MetricBundle), String> {
-        // TEMP DEBUG: simulate multi-second real-world API latency without hitting the network.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        return Err("TEMP DEBUG simulated latency".to_string());
-        #[allow(unreachable_code)]
         let api_key = self
             .config
             .api_key
