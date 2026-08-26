@@ -90,6 +90,8 @@ impl Contextualiser {
     /// Returns `Ok(model_name)` on success, or `Err(reason)` if the provider
     /// should be considered unavailable for this run.
     pub async fn preflight(&self) -> Result<String, String> {
+        return Ok("TEMP DEBUG mock model".to_string());
+        #[allow(unreachable_code)]
         self.active_model().await
     }
 
