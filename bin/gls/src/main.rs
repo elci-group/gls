@@ -10,10 +10,11 @@
 //! Discovery events are emitted immediately so names appear at T0.
 //! TYPE and BART run concurrently.  INDEX and CONTEXT follow after.
 
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use gls_bart::measure_entry;
 use gls_bound::{select_candidates, Bound};
 use gls_context::{ContextConfig, Contextualiser};
@@ -26,6 +27,9 @@ use gls_padagonia::{Padagonia, PadagoniaConfig};
 use gls_render::{OutputMode, RenderConfig, Renderer};
 use gls_type::classify_entry;
 
+mod menu;
+mod provider_cmd;
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
@@ -35,8 +39,12 @@ use gls_type::classify_entry;
     long_about = None,
 )]
 struct Cli {
+    /// Subcommand (omit to run a normal scan).
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Target path to inspect.
-    #[arg(default_value = ".")]
+    #[arg(default_value = ".", global = false)]
     target: PathBuf,
 
     /// Recursion depth (0 = root only, 1 = direct children, …).
@@ -48,16 +56,21 @@ struct Cli {
     hidden: bool,
 
     /// Disable animation (static output).
-    #[arg(long = "no-animate", action = ArgAction::SetTrue)]
+    #[arg(long = "no-animate", action = ArgAction::SetTrue, conflicts_with = "animate")]
     no_animate: bool,
 
     /// Force animation even when stdout is not a TTY.
     #[arg(long = "animate", action = ArgAction::SetTrue)]
     animate: bool,
 
-    /// Watch mode: re-run on filesystem changes.
-    #[arg(long, action = ArgAction::SetTrue)]
-    watch: bool,
+    /// Print the final listing as one entry per line instead of a
+    /// horizontally-filled, dynamically-categorised grid.
+    #[arg(long = "no-grid", action = ArgAction::SetTrue, conflicts_with = "grid")]
+    no_grid: bool,
+
+    /// Force the grid layout even when stdout is not a TTY.
+    #[arg(long = "grid", action = ArgAction::SetTrue)]
+    grid: bool,
 
     /// Skip AI contextualisation.
     #[arg(long = "no-context", action = ArgAction::SetTrue)]
@@ -75,10 +88,42 @@ struct Cli {
     #[arg(long = "output", value_enum, default_value_t = OutputArg::Auto)]
     output: OutputArg,
 
+    /// Sort order for displayed entries.
+    #[arg(long, value_enum, default_value_t = SortOrder::Name)]
+    sort: SortOrder,
+
     /// Groq model to use for contextualisation.
     /// Defaults to the GLS_GROQ_MODEL env var, then the current recommended model.
     #[arg(long)]
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum Command {
+    /// Show contextualisation history for a path from Padagonia.
+    History {
+        /// Path to query.
+        path: PathBuf,
+        /// Maximum number of revisions to show (default: all).
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+    },
+    /// Interactively choose an inference provider and model.
+    ///
+    /// Model availability is resolved by polling the provider's real
+    /// model-listing API, cached persistently in Padagonia with a 1-hour
+    /// TTL. The selection is saved for reference by future runs.
+    Provider {
+        /// Bypass the cache and force a fresh poll of model availability.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Show BART's recorded size breakdown for a directory from Padagonia:
+    /// its own recursively-aggregated total, and each direct child's.
+    Size {
+        /// Path to query.
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -93,15 +138,49 @@ enum OutputArg {
     Tty,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum SortOrder {
+    /// Alphabetical by name (default).
+    Name,
+    /// Largest first (by logical bytes).
+    Size,
+    /// Group by semantic type.
+    Type,
+    /// Most recently modified first.
+    Modified,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
+    // ── Subcommands ────────────────────────────────────────────────────────────
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            Command::History { path, limit } => {
+                run_history(path, *limit);
+                return;
+            }
+            Command::Provider { refresh } => {
+                provider_cmd::run(*refresh).await;
+                return;
+            }
+            Command::Size { path } => {
+                run_size(path);
+                return;
+            }
+        }
+    }
+
     // ── Bound ─────────────────────────────────────────────────────────────────
     let bound = Bound {
-        depth: if cli.deep { cli.depth.max(3) } else { cli.depth },
+        depth: if cli.deep {
+            cli.depth.max(3)
+        } else {
+            cli.depth
+        },
         no_context: cli.no_context,
         incremental: !cli.force_context,
         max_context_candidates: if cli.deep { 256 } else { 64 },
@@ -114,46 +193,57 @@ async fn main() {
     let rx_padagonia = tx.subscribe();
 
     // ── Renderer output mode ───────────────────────────────────────────────────
+    let stdout_is_tty = std::io::stdout().is_terminal();
     let output_mode = match cli.output {
-        OutputArg::Json  => OutputMode::Json,
+        OutputArg::Json => OutputMode::Json,
         OutputArg::Plain => OutputMode::Plain,
-        OutputArg::Tty   => OutputMode::Tty,
-        OutputArg::Auto  => {
-            if cli.no_animate {
-                OutputMode::Plain
-            } else {
+        OutputArg::Tty => OutputMode::Tty,
+        OutputArg::Auto => {
+            if cli.animate || (stdout_is_tty && !cli.no_animate) {
                 OutputMode::Tty
+            } else {
+                OutputMode::Plain
             }
         }
     };
 
-    let tick = if cli.no_animate
-        || output_mode == OutputMode::Plain
-        || output_mode == OutputMode::Json
-    {
-        None
+    let tick =
+        if cli.no_animate || output_mode == OutputMode::Plain || output_mode == OutputMode::Json {
+            None
+        } else {
+            Some(Duration::from_millis(600))
+        };
+
+    let grid = if cli.no_grid {
+        false
+    } else if cli.grid {
+        true
     } else {
-        Some(Duration::from_millis(600))
+        output_mode == OutputMode::Tty && stdout_is_tty
     };
 
     let render_config = RenderConfig {
         mode: output_mode,
         tick_interval: tick,
+        grid,
     };
 
     // ── Padagonia ──────────────────────────────────────────────────────────────
-    let padagonia = Padagonia::open(&PadagoniaConfig::default())
-        .unwrap_or_else(|e| {
-            eprintln!("[warn] padagonia unavailable: {e}");
-            Padagonia::open(&PadagoniaConfig {
-                db_path: PathBuf::from(":memory:"),
-            })
-            .expect("in-memory SQLite must always work")
-        });
+    let padagonia = Padagonia::open(&PadagoniaConfig::default()).unwrap_or_else(|e| {
+        eprintln!("[warn] padagonia unavailable: {e}");
+        Padagonia::open(&PadagoniaConfig {
+            db_path: PathBuf::from(":memory:"),
+        })
+        .expect("in-memory SQLite must always work")
+    });
+    // Keep clones for incremental cache-hit filtering in the CONTEXT phase
+    // and for persisting BART's recursive size breakdown.
+    let padagonia_query = padagonia.clone();
+    let padagonia_sizes = padagonia.clone();
 
     // ── Spawn renderer and Padagonia consumer ──────────────────────────────────
     let renderer = Renderer::new(render_config);
-    let render_task    = tokio::spawn(async move { renderer.run(rx_render).await });
+    let render_task = tokio::spawn(async move { renderer.run(rx_render).await });
     let padagonia_task = tokio::spawn(async move { padagonia.consume_stream(rx_padagonia).await });
 
     // ── DISCOVER ───────────────────────────────────────────────────────────────
@@ -162,34 +252,96 @@ async fn main() {
     // so the renderer shows names at T0.
     let target = cli.target.canonicalize().unwrap_or(cli.target.clone());
 
-    let entries = collect_discovered(&target, &bound, cli.hidden).await;
+    let discover_config = DiscoverConfig {
+        max_depth: bound.depth,
+        follow_links: false,
+        include_hidden: cli.hidden,
+    };
+    let mut entries =
+        gls_discover::discover(target.clone(), discover_config, tx.clone()).await;
 
-    // T0: emit names immediately.
-    for entry in &entries {
-        let _ = tx.send(PipelineEvent::Discovery(entry.clone()));
-    }
+    // ── SORT ───────────────────────────────────────────────────────────────────
+    sort_entries(&mut entries, cli.sort);
+
+    let _ = tx.send(PipelineEvent::OrderUpdated {
+        paths: entries.iter().map(|entry| entry.path.clone()).collect(),
+    });
 
     // ── TYPE ∥ BART ────────────────────────────────────────────────────────────
-    // Run classification and physical measurement concurrently.
-    let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+    // Run classification and physical measurement concurrently, collecting both
+    // result maps so they can be forwarded into the INDEX phase descriptors.
+    let measurement_requests: Vec<(PathBuf, usize)> = entries
+        .iter()
+        .map(|entry| {
+            let entry_depth = entry.relative.components().count();
+            (
+                entry.path.clone(),
+                bound.depth.saturating_sub(entry_depth),
+            )
+        })
+        .collect();
 
     let tx_type = tx.clone();
     let tx_bart = tx.clone();
     let entries_clone = entries.clone();
 
-    let ((), ()) = tokio::join!(
-        async move { classify_entry(entries_clone, tx_type).await },
-        async move { measure_entry(paths,           tx_bart).await },
+    let (classification_results, measurement_results) = tokio::join!(
+        classify_entry(entries_clone, tx_type),
+        measure_entry(measurement_requests, tx_bart),
     );
 
+    let classifications: std::collections::HashMap<_, _> =
+        classification_results.into_iter().collect();
+    let measurements: std::collections::HashMap<_, _> = measurement_results
+        .iter()
+        .map(|result| (result.measure.path.clone(), result.measure.clone()))
+        .collect();
+    let aggregates: Vec<_> = measurement_results
+        .into_iter()
+        .flat_map(|result| result.aggregates)
+        .collect();
+    if let Err(error) = padagonia_sizes.store_size_aggregates(&aggregates) {
+        eprintln!("[warn] could not persist size aggregates: {error}");
+    }
+
     // ── INDEX ──────────────────────────────────────────────────────────────────
-    // Build descriptors privately; forward Indexed events to the main channel.
-    let descriptors = collect_descriptors(&entries, tx.clone()).await;
+    // Build descriptors with type + physical data attached; forward events.
+    let descriptor_items = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                classifications.get(&entry.path).cloned(),
+                measurements.get(&entry.path).cloned(),
+            )
+        })
+        .collect();
+    let descriptors =
+        build_descriptor(descriptor_items, bound.excerpt_bytes, tx.clone()).await;
 
     // ── CONTEXT ────────────────────────────────────────────────────────────────
     if !bound.no_context {
         let weighted: Vec<_> = descriptors
             .into_iter()
+            // Credential-like files are never sent to a remote provider.
+            .filter(|d| {
+                classifications
+                    .get(&d.path)
+                    .map(|classification| {
+                        classification.semantic_type
+                            != gls_core::semantic::SemanticType::Credential
+                    })
+                    .unwrap_or(true)
+            })
+            // When incremental mode is on, skip objects whose descriptor_hash
+            // matches the latest Padagonia record (content unchanged since last run).
+            .filter(|d| {
+                if bound.incremental {
+                    !padagonia_query.is_cache_hit(&d.path, &d.descriptor_hash)
+                } else {
+                    true
+                }
+            })
             .map(|d| {
                 let weight = serde_json::to_vec(&d.payload)
                     .map(|v| v.len() as u64)
@@ -214,58 +366,130 @@ async fn main() {
     let _ = tokio::join!(render_task, padagonia_task);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Discover filesystem entries via a private channel, returning them as a Vec.
-async fn collect_discovered(
-    target: &PathBuf,
-    bound: &Bound,
-    include_hidden: bool,
-) -> Vec<FsEntry> {
-    let (tx2, mut rx2) = tokio::sync::broadcast::channel::<PipelineEvent>(1024);
-    let cfg = DiscoverConfig {
-        max_depth: bound.depth,
-        follow_links: false,
-        include_hidden,
-    };
-    gls_discover::discover(target.clone(), cfg, tx2.clone()).await;
-    drop(tx2);
-
-    let mut entries = Vec::new();
-    loop {
-        match rx2.recv().await {
-            Ok(PipelineEvent::Discovery(e)) => entries.push(e),
-            Ok(_) => {}
-            Err(_) => break,
+/// Sort a mutable entry list in-place according to the requested order.
+fn sort_entries(entries: &mut [FsEntry], order: SortOrder) {
+    match order {
+        SortOrder::Name => {
+            entries.sort_by(|a, b| a.basename.to_lowercase().cmp(&b.basename.to_lowercase()));
+        }
+        SortOrder::Size => {
+            entries.sort_by(|a, b| b.logical_bytes.cmp(&a.logical_bytes));
+        }
+        SortOrder::Type => {
+            // Stable sort: alphabetical within each kind bucket.
+            entries.sort_by(|a, b| {
+                let ka = kind_bucket(a);
+                let kb = kind_bucket(b);
+                ka.cmp(&kb)
+                    .then_with(|| a.basename.to_lowercase().cmp(&b.basename.to_lowercase()))
+            });
+        }
+        SortOrder::Modified => {
+            entries.sort_by(|a, b| b.modified.cmp(&a.modified));
         }
     }
-    entries
 }
 
-/// Build descriptors for every entry, emit Indexed events on `tx`, and return
-/// the descriptors for use by the CONTEXT phase.
-async fn collect_descriptors(
-    entries: &[FsEntry],
-    tx: tokio::sync::broadcast::Sender<PipelineEvent>,
-) -> Vec<gls_index::Descriptor> {
-    let (tx_idx, mut rx_idx) = tokio::sync::broadcast::channel::<PipelineEvent>(1024);
-    let items: Vec<_> = entries
-        .iter()
-        .map(|e| (e.path.clone(), None, None))
-        .collect();
-    build_descriptor(items, tx_idx.clone()).await;
-    drop(tx_idx);
-
-    let mut descriptors = Vec::new();
-    loop {
-        match rx_idx.recv().await {
-            Ok(PipelineEvent::Indexed(d)) => {
-                let _ = tx.send(PipelineEvent::Indexed(d.clone()));
-                descriptors.push(d);
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
+/// Numeric bucket for `SortOrder::Type` grouping (directories first).
+fn kind_bucket(e: &FsEntry) -> u8 {
+    use gls_core::entry::EntryKind;
+    match e.kind {
+        EntryKind::Directory => 0,
+        EntryKind::File => 1,
+        EntryKind::Symlink => 2,
+        EntryKind::Other => 3,
     }
-    descriptors
+}
+
+/// Print Padagonia contextualisation history for a single path.
+fn run_history(path: &Path, limit: Option<usize>) {
+    let padagonia = match Padagonia::open(&PadagoniaConfig::default()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[error] cannot open Padagonia: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let revisions = padagonia.history(&canonical);
+
+    if revisions.is_empty() {
+        println!("No history for: {}", canonical.display());
+        return;
+    }
+
+    let revisions: Vec<_> = if let Some(n) = limit {
+        revisions.into_iter().take(n).collect()
+    } else {
+        revisions
+    };
+
+    println!("History for: {}", canonical.display());
+    println!("{:<38}  {}", "revision", "timestamp");
+    println!("{}", "-".repeat(60));
+    for (rev, ts) in &revisions {
+        println!("{rev}  {ts}");
+    }
+}
+
+/// Print BART's recorded recursive size breakdown for a path, from
+/// Padagonia: its own aggregate, then each direct child sorted largest
+/// first. Requires the path to have been measured by a prior `gls` run —
+/// this reads the persisted record, it doesn't re-walk the filesystem.
+fn run_size(path: &Path) {
+    let padagonia = match Padagonia::open(&PadagoniaConfig::default()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[error] cannot open Padagonia: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    let Some(record) = padagonia.size_aggregate(&canonical) else {
+        println!(
+            "No recorded size measurement for: {}\n(run `gls` against a parent directory first — \
+             BART records a size aggregate for every directory it walks through)",
+            canonical.display()
+        );
+        return;
+    };
+
+    println!(
+        "{}  {}  ({} objects{}, depth {})",
+        canonical.display(),
+        gls_render::human_bytes(record.tree_bytes),
+        record.object_count,
+        record
+            .reclaimable_fraction
+            .filter(|f| *f > 0.0)
+            .map(|f| format!(", {:.0}% reclaimable", f * 100.0))
+            .unwrap_or_default(),
+        record.depth,
+    );
+    println!("measured: {}", record.measured_at.to_rfc3339());
+
+    let children = padagonia.size_children(&canonical);
+    if children.is_empty() {
+        if !record.is_leaf {
+            println!("(children not yet recorded — re-run `gls` here to refresh)");
+        }
+        return;
+    }
+
+    println!();
+    for child in &children {
+        let name = child
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| child.path.display().to_string());
+        println!(
+            "  {:>10}  {name}{}",
+            gls_render::human_bytes(child.tree_bytes),
+            if child.is_leaf { "" } else { "/" }
+        );
+    }
 }

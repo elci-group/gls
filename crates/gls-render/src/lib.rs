@@ -2,9 +2,13 @@
 //!
 //! Consumes the pipeline event stream and drives the terminal presentation.
 
-mod state;
-mod renderer;
+mod dimension;
 mod format;
+mod grid;
+mod queue;
+mod renderer;
+mod state;
 
-pub use renderer::{Renderer, RenderConfig, OutputMode};
+pub use format::human_bytes;
+pub use renderer::{OutputMode, RenderConfig, Renderer};
 pub use state::EntryDisplayState;

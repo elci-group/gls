@@ -3,17 +3,70 @@
 
 use crate::semantic::Provenance;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
-/// Channel capacity for the pipeline broadcast.
-pub const CHANNEL_CAPACITY: usize = 1024;
+/// Lossless fan-out sender for pipeline events.
+///
+/// Tokio's bounded broadcast channel is intentionally lossy when a receiver
+/// falls behind. That is useful for telemetry, but not for GLS: every event is
+/// part of the user-visible result or the persistent record. Each subscriber
+/// therefore gets its own unbounded queue. The pipeline itself is bounded by
+/// discovery depth and contextualisation budgets.
+#[derive(Clone, Default)]
+pub struct PipelineSender {
+    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<crate::event::PipelineEvent>>>>,
+}
 
-/// Create a new pipeline broadcast channel pair.
-pub fn channel() -> (
-    broadcast::Sender<crate::event::PipelineEvent>,
-    broadcast::Receiver<crate::event::PipelineEvent>,
-) {
-    broadcast::channel(CHANNEL_CAPACITY)
+/// One lossless subscription to the pipeline event stream.
+pub struct PipelineReceiver {
+    receiver: mpsc::UnboundedReceiver<crate::event::PipelineEvent>,
+}
+
+impl PipelineSender {
+    /// Add an independent consumer to the event stream.
+    pub fn subscribe(&self) -> PipelineReceiver {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .expect("pipeline subscriber lock poisoned")
+            .push(sender);
+        PipelineReceiver { receiver }
+    }
+
+    /// Deliver an event to every live subscriber, returning the number reached.
+    pub fn send(&self, event: crate::event::PipelineEvent) -> usize {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("pipeline subscriber lock poisoned");
+        let mut delivered = 0;
+        subscribers.retain(|subscriber| {
+            let live = subscriber.send(event.clone()).is_ok();
+            delivered += usize::from(live);
+            live
+        });
+        delivered
+    }
+}
+
+impl PipelineReceiver {
+    pub async fn recv(&mut self) -> Option<crate::event::PipelineEvent> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<crate::event::PipelineEvent, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+/// Create a pipeline with its first subscriber already attached.
+pub fn channel() -> (PipelineSender, PipelineReceiver) {
+    let sender = PipelineSender::default();
+    let receiver = sender.subscribe();
+    (sender, receiver)
 }
 
 // ── Metric primitives ────────────────────────────────────────────────────────
@@ -68,13 +121,13 @@ impl PresentationState {
     /// Advance to the next state.  Returns `Stable` once fully processed.
     pub fn advance(self) -> Self {
         match self {
-            Self::Discovered     => Self::Classified,
-            Self::Classified     => Self::Measured,
-            Self::Measured       => Self::Indexed,
-            Self::Indexed        => Self::Contextualised,
+            Self::Discovered => Self::Classified,
+            Self::Classified => Self::Measured,
+            Self::Measured => Self::Indexed,
+            Self::Indexed => Self::Contextualised,
             Self::Contextualised => Self::Valuated,
-            Self::Valuated       => Self::Stable,
-            Self::Stable         => Self::Stable,
+            Self::Valuated => Self::Stable,
+            Self::Stable => Self::Stable,
         }
     }
 }

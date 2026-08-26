@@ -4,30 +4,37 @@
 use gls_core::{
     entry::{EntryKind, FsEntry},
     event::PipelineEvent,
+    pipeline::PipelineSender,
     semantic::{Classification, SemanticType},
 };
 use std::path::Path;
-use tokio::sync::broadcast;
 
 // ── Public surface ──────────────────────────────────────────────────────────
 
-/// Classify a batch of discovered entries and emit `TypeDetected` events.
+/// Classify a batch, emit `TypeDetected` events, and return every result.
 pub async fn classify_entry(
     entries: Vec<FsEntry>,
-    tx: broadcast::Sender<PipelineEvent>,
-) {
+    tx: PipelineSender,
+) -> Vec<(std::path::PathBuf, Classification)> {
     let results = tokio::task::spawn_blocking(move || {
-        entries.into_iter().map(|e| {
-            let cls = classify_fs_entry(&e);
-            (e.path.clone(), cls)
-        }).collect::<Vec<_>>()
+        entries
+            .into_iter()
+            .map(|e| {
+                let cls = classify_fs_entry(&e);
+                (e.path.clone(), cls)
+            })
+            .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
 
-    for (path, classification) in results {
-        let _ = tx.send(PipelineEvent::TypeDetected { path, classification });
+    for (path, classification) in &results {
+        let _ = tx.send(PipelineEvent::TypeDetected {
+            path: path.clone(),
+            classification: classification.clone(),
+        });
     }
+    results
 }
 
 /// Classify a single path (convenience wrapper used by tests and the CLI).
@@ -49,7 +56,8 @@ pub fn classify_path(path: &Path) -> Classification {
 
 fn classify_fs_entry(entry: &FsEntry) -> Classification {
     let basename = entry.basename.to_lowercase();
-    let ext = entry.path
+    let ext = entry
+        .path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
@@ -57,23 +65,25 @@ fn classify_fs_entry(entry: &FsEntry) -> Classification {
     classify_by_signals(&basename, &ext, is_dir, &entry.path)
 }
 
-fn classify_by_signals(
-    basename: &str,
-    ext: &str,
-    is_dir: bool,
-    path: &Path,
-) -> Classification {
+fn classify_by_signals(basename: &str, ext: &str, is_dir: bool, path: &Path) -> Classification {
     let mut evidence = Vec::new();
 
     // ── Directories ──────────────────────────────────────────────────────────
     if is_dir {
         // Named build artefact directories.
-        if matches!(basename, "target" | "node_modules" | ".git" | "dist" | "build" | "__pycache__") {
-            evidence.push(format!("directory name `{basename}` is a known build/cache directory"));
+        if matches!(
+            basename,
+            "target" | "node_modules" | ".git" | "dist" | "build" | "__pycache__"
+        ) {
+            evidence.push(format!(
+                "directory name `{basename}` is a known build/cache directory"
+            ));
             return cls(SemanticType::BuildArtefact, 0.95, evidence, None);
         }
         if matches!(basename, "tests" | "test" | "spec" | "__tests__") {
-            evidence.push(format!("directory name `{basename}` is a test directory convention"));
+            evidence.push(format!(
+                "directory name `{basename}` is a test directory convention"
+            ));
             return cls(SemanticType::TestSuite, 0.90, evidence, None);
         }
         evidence.push("entry is a directory".to_string());
@@ -99,13 +109,19 @@ fn classify_by_signals(
     }
 
     // ── Archives ─────────────────────────────────────────────────────────────
-    if matches!(ext, "zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "tgz") {
+    if matches!(
+        ext,
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "tgz"
+    ) {
         evidence.push(format!("extension `.{ext}` is an archive format"));
         return cls(SemanticType::Archive, 0.97, evidence, None);
     }
 
     // ── Images ───────────────────────────────────────────────────────────────
-    if matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "bmp" | "tiff") {
+    if matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "bmp" | "tiff"
+    ) {
         evidence.push(format!("extension `.{ext}` is an image format"));
         return cls(SemanticType::Image, 0.97, evidence, None);
     }
@@ -123,13 +139,19 @@ fn classify_by_signals(
     }
 
     // ── Databases ────────────────────────────────────────────────────────────
-    if matches!(ext, "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" | "duckdb") {
+    if matches!(
+        ext,
+        "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" | "duckdb"
+    ) {
         evidence.push(format!("extension `.{ext}` is a database format"));
         return cls(SemanticType::Database, 0.95, evidence, None);
     }
 
     // ── Datasets ─────────────────────────────────────────────────────────────
-    if matches!(ext, "csv" | "tsv" | "parquet" | "arrow" | "ndjson" | "jsonl") {
+    if matches!(
+        ext,
+        "csv" | "tsv" | "parquet" | "arrow" | "ndjson" | "jsonl"
+    ) {
         evidence.push(format!("extension `.{ext}` is a data format"));
         return cls(SemanticType::Dataset, 0.90, evidence, None);
     }
@@ -137,7 +159,9 @@ fn classify_by_signals(
     // ── Configuration ────────────────────────────────────────────────────────
     let (config_type, config_lang) = config_type(basename, ext);
     if let Some(lang) = config_lang {
-        evidence.push(format!("filename/extension matches configuration pattern for `{lang}`"));
+        evidence.push(format!(
+            "filename/extension matches configuration pattern for `{lang}`"
+        ));
         return cls(config_type, 0.90, evidence, Some(lang));
     }
 
@@ -145,8 +169,14 @@ fn classify_by_signals(
     if matches!(ext, "md" | "mdx" | "rst" | "txt" | "adoc" | "tex" | "wiki")
         || matches!(
             basename,
-            "readme" | "changelog" | "license" | "contributing" | "authors"
-                | "credits" | "notice" | "copying"
+            "readme"
+                | "changelog"
+                | "license"
+                | "contributing"
+                | "authors"
+                | "credits"
+                | "notice"
+                | "copying"
         )
         || basename.starts_with("readme")
         || basename.starts_with("changelog")
@@ -159,7 +189,12 @@ fn classify_by_signals(
     // ── Executables ──────────────────────────────────────────────────────────
     if matches!(ext, "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd") {
         evidence.push(format!("extension `.{ext}` is a shell/script format"));
-        return cls(SemanticType::Executable, 0.90, evidence, Some(ext.to_string()));
+        return cls(
+            SemanticType::Executable,
+            0.90,
+            evidence,
+            Some(ext.to_string()),
+        );
     }
 
     // ── Source code ──────────────────────────────────────────────────────────
@@ -196,20 +231,33 @@ fn cls(
 
 fn config_type(basename: &str, ext: &str) -> (SemanticType, Option<String>) {
     match (basename, ext) {
-        ("cargo.toml", _) | ("cargo.lock", _) => (SemanticType::Configuration, Some("Rust/Cargo".into())),
-        ("package.json", _) | ("package-lock.json", _) | ("yarn.lock", _) | ("pnpm-lock.yaml", _) =>
-            (SemanticType::Configuration, Some("Node.js".into())),
-        ("pyproject.toml", _) | ("setup.cfg", _) | ("setup.py", _) | ("requirements.txt", _) =>
-            (SemanticType::Configuration, Some("Python".into())),
+        ("cargo.toml", _) | ("cargo.lock", _) => {
+            (SemanticType::Configuration, Some("Rust/Cargo".into()))
+        }
+        ("package.json", _)
+        | ("package-lock.json", _)
+        | ("yarn.lock", _)
+        | ("pnpm-lock.yaml", _) => (SemanticType::Configuration, Some("Node.js".into())),
+        ("pyproject.toml", _) | ("setup.cfg", _) | ("setup.py", _) | ("requirements.txt", _) => {
+            (SemanticType::Configuration, Some("Python".into()))
+        }
         ("go.mod", _) | ("go.sum", _) => (SemanticType::Configuration, Some("Go".into())),
-        ("dockerfile", _) | ("docker-compose.yml", _) | ("docker-compose.yaml", _) =>
-            (SemanticType::Configuration, Some("Docker".into())),
-        (".gitignore", _) | (".gitattributes", _) | (".gitmodules", _) =>
-            (SemanticType::Configuration, Some("Git".into())),
-        (".editorconfig", _) | (".prettierrc", _) | (".eslintrc", _) =>
-            (SemanticType::Configuration, Some("editor/linter".into())),
-        _ if matches!(ext, "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" | "conf" | "env") =>
-            (SemanticType::Configuration, Some(ext.to_uppercase())),
+        ("dockerfile", _) | ("docker-compose.yml", _) | ("docker-compose.yaml", _) => {
+            (SemanticType::Configuration, Some("Docker".into()))
+        }
+        (".gitignore", _) | (".gitattributes", _) | (".gitmodules", _) => {
+            (SemanticType::Configuration, Some("Git".into()))
+        }
+        (".editorconfig", _) | (".prettierrc", _) | (".eslintrc", _) => {
+            (SemanticType::Configuration, Some("editor/linter".into()))
+        }
+        _ if matches!(
+            ext,
+            "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" | "conf" | "env"
+        ) =>
+        {
+            (SemanticType::Configuration, Some(ext.to_uppercase()))
+        }
         _ => (SemanticType::Unknown, None),
     }
 }
@@ -254,13 +302,15 @@ fn doc_language(ext: &str) -> Option<String> {
 /// Attempt simple magic-byte detection.  Returns `None` if the file cannot
 /// be read or no magic is recognised.
 fn try_magic(path: &Path, evidence: &mut Vec<String>) -> Option<Classification> {
-    let buf = {
-        let mut f = std::fs::File::open(path).ok()?;
-        let mut buf = [0u8; 16];
-        use std::io::Read;
-        f.read(&mut buf).ok()?;
-        buf
-    };
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 16];
+    // Partial reads are fine for magic detection; we just need the first bytes.
+    let n = f.read(&mut buf).ok()?;
+    let buf = &buf[..n];
+    if buf.len() < 4 {
+        return None;
+    }
 
     // ELF binary
     if &buf[..4] == b"\x7fELF" {
@@ -273,7 +323,7 @@ fn try_magic(path: &Path, evidence: &mut Vec<String>) -> Option<Classification> 
         return Some(cls(SemanticType::Executable, 0.99, evidence.clone(), None));
     }
     // Mach-O
-    if &buf[..4] == b"\xcf\xfa\xed\xfe" || &buf[..4] == b"\xce\xfa\xed\xfe" {
+    if buf.len() >= 4 && (&buf[..4] == b"\xcf\xfa\xed\xfe" || &buf[..4] == b"\xce\xfa\xed\xfe") {
         evidence.push("magic bytes: Mach-O binary".into());
         return Some(cls(SemanticType::Executable, 0.99, evidence.clone(), None));
     }

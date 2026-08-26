@@ -426,6 +426,7 @@ name = "gls"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossterm",
  "gls-bart",
  "gls-bound",
  "gls-context",
@@ -434,6 +435,7 @@ dependencies = [
  "gls-index",
  "gls-metrics",
  "gls-padagonia",
+ "gls-provider",
  "gls-render",
  "gls-type",
  "serde_json",
@@ -448,7 +450,6 @@ dependencies = [
  "gls-core",
  "thiserror 1.0.69",
  "tokio",
- "walkdir",
 ]
 
 [[package]]
@@ -536,15 +537,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "gls-provider"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "gls-padagonia",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "gls-render"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "gls-core",
  "libc",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1613,6 +1627,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "untrusted"

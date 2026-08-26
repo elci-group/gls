@@ -4,10 +4,10 @@ use chrono::{DateTime, Utc};
 use gls_core::{
     entry::{EntryKind, FsEntry},
     event::PipelineEvent,
+    pipeline::PipelineSender,
 };
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use tokio::sync::broadcast;
 use walkdir::WalkDir;
 
 /// Configuration for the discovery walk.
@@ -31,35 +31,35 @@ impl Default for DiscoverConfig {
     }
 }
 
-/// Walk `root` according to `config` and emit `Discovery` events on `tx`.
+/// Walk `root`, emitting each `Discovery` event as it is found and returning
+/// the complete set for downstream phases.
 ///
 /// Runs the blocking walkdir call on a Tokio blocking thread so the async
 /// runtime is never stalled.
 pub async fn discover(
     root: PathBuf,
     config: DiscoverConfig,
-    tx: broadcast::Sender<PipelineEvent>,
-) {
+    tx: PipelineSender,
+) -> Vec<FsEntry> {
     let root_clone = root.clone();
-    let entries = tokio::task::spawn_blocking(move || {
-        collect_entries(&root_clone, &config)
-    })
-    .await
-    .unwrap_or_default();
-
-    for entry in entries {
-        // Ignore send errors: the receiver may have been dropped.
-        let _ = tx.send(PipelineEvent::Discovery(entry));
-    }
+    tokio::task::spawn_blocking(move || collect_entries(&root_clone, &config, &tx))
+        .await
+        .unwrap_or_default()
 }
 
-fn collect_entries(root: &Path, config: &DiscoverConfig) -> Vec<FsEntry> {
+fn collect_entries(root: &Path, config: &DiscoverConfig, tx: &PipelineSender) -> Vec<FsEntry> {
     let mut out = Vec::new();
 
     let walker = WalkDir::new(root)
         .max_depth(config.max_depth)
         .follow_links(config.follow_links)
-        .sort_by_file_name();
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || config.include_hidden
+                || !entry.file_name().to_string_lossy().starts_with('.')
+        });
 
     for result in walker {
         let dent = match result {
@@ -75,15 +75,7 @@ fn collect_entries(root: &Path, config: &DiscoverConfig) -> Vec<FsEntry> {
         let path = dent.path();
         let basename = dent.file_name().to_string_lossy().to_string();
 
-        // Hidden filter.
-        if !config.include_hidden && basename.starts_with('.') {
-            continue;
-        }
-
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_path_buf();
+        let relative = path.strip_prefix(root).unwrap_or(path).to_path_buf();
 
         let ft = dent.file_type();
         let kind = if ft.is_dir() {
@@ -99,15 +91,18 @@ fn collect_entries(root: &Path, config: &DiscoverConfig) -> Vec<FsEntry> {
         let symlink = ft.is_symlink();
 
         let meta = dent.metadata().ok();
-        let permissions = meta.as_ref().map(|m| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                m.permissions().mode()
-            }
-            #[cfg(not(unix))]
-            0u32
-        }).unwrap_or(0);
+        let permissions = meta
+            .as_ref()
+            .map(|m| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode()
+                }
+                #[cfg(not(unix))]
+                0u32
+            })
+            .unwrap_or(0);
 
         let modified: Option<DateTime<Utc>> = meta
             .as_ref()
@@ -131,7 +126,7 @@ fn collect_entries(root: &Path, config: &DiscoverConfig) -> Vec<FsEntry> {
             }
         };
 
-        out.push(FsEntry {
+        let entry = FsEntry {
             path: path.to_path_buf(),
             basename,
             relative,
@@ -142,7 +137,9 @@ fn collect_entries(root: &Path, config: &DiscoverConfig) -> Vec<FsEntry> {
             modified,
             inode,
             logical_bytes,
-        });
+        };
+        let _ = tx.send(PipelineEvent::Discovery(entry.clone()));
+        out.push(entry);
     }
 
     out

@@ -1,0 +1,11 @@
+[package]
+name    = "gls-provider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gls-padagonia = { path = "../gls-padagonia" }
+tokio         = { version = "1", features = ["full"] }
+reqwest       = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde         = { version = "1", features = ["derive"] }
+chrono        = { version = "0.4", features = ["serde"] }

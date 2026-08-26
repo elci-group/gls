@@ -4,44 +4,59 @@
 //! than reading the raw file.  It captures structural signals, excerpts, and
 //! hashes.
 
-use gls_core::event::{Descriptor, PhysicalMeasure, PipelineEvent};
+use gls_core::{
+    event::{Descriptor, PhysicalMeasure, PipelineEvent},
+    pipeline::PipelineSender,
+};
 use gls_core::semantic::Classification;
+use gls_core::semantic::SemanticType;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokio::sync::broadcast;
 
 /// Build descriptors for a batch of objects and emit `Indexed` events.
 pub async fn build_descriptor(
     items: Vec<(PathBuf, Option<Classification>, Option<PhysicalMeasure>)>,
-    tx: broadcast::Sender<PipelineEvent>,
-) {
+    excerpt_bytes: usize,
+    tx: PipelineSender,
+) -> Vec<Descriptor> {
     let results = tokio::task::spawn_blocking(move || {
         items
             .into_iter()
-            .map(|(path, cls, meas)| build_one(&path, cls.as_ref(), meas.as_ref()))
+            .map(|(path, cls, meas)| {
+                build_one(&path, cls.as_ref(), meas.as_ref(), excerpt_bytes)
+            })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
 
-    for desc in results {
-        let _ = tx.send(PipelineEvent::Indexed(desc));
+    for desc in &results {
+        let _ = tx.send(PipelineEvent::Indexed(desc.clone()));
     }
+    results
 }
 
 fn build_one(
     path: &Path,
     cls: Option<&Classification>,
     meas: Option<&PhysicalMeasure>,
+    excerpt_bytes: usize,
 ) -> Descriptor {
-    let basename = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let basename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let ext = path.extension().map(|e| e.to_string_lossy().to_string());
 
     let source_hash = hash_path(path);
-    let excerpt = extract_excerpt(path);
-    let line_count = count_lines(path);
+    let excerpt = if cls.is_some_and(|c| c.semantic_type == SemanticType::Credential) {
+        None
+    } else {
+        extract_excerpt(path, excerpt_bytes)
+    };
+    let line_count = meas.and_then(|measurement| measurement.line_count);
 
     let type_info: Value = if let Some(c) = cls {
         json!({
@@ -66,7 +81,7 @@ fn build_one(
     };
 
     let payload = json!({
-        "path": path.to_string_lossy(),
+        "path": basename,
         "basename": basename,
         "extension": ext,
         "type": type_info,
@@ -97,30 +112,27 @@ fn hash_path(path: &Path) -> Option<String> {
     Some(hex::encode(Sha256::digest(&buf[..n])))
 }
 
-/// First ~20 non-empty lines, trimmed.
-fn extract_excerpt(path: &Path) -> Option<Vec<String>> {
+/// First ~20 non-empty lines from a strictly bounded byte prefix.
+fn extract_excerpt(path: &Path, max_bytes: usize) -> Option<Vec<String>> {
     if path.is_dir() {
         return None;
     }
     let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = String::new();
-    // Read at most 8 KiB to avoid loading huge files.
-    f.read_to_string(&mut buf).ok()?;
-    let lines: Vec<String> = buf
+    let mut buf = Vec::with_capacity(max_bytes.min(8 * 1024));
+    f.by_ref()
+        .take(max_bytes as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .take(20)
         .map(|l| l.trim().to_string())
         .collect();
-    if lines.is_empty() { None } else { Some(lines) }
-}
-
-fn count_lines(path: &Path) -> Option<u64> {
-    if path.is_dir() {
-        return None;
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
     }
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(f);
-    Some(reader.lines().count() as u64)
 }

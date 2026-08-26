@@ -14,19 +14,19 @@
 
 use gls_core::{
     event::{ContextAnnotation, Descriptor, MetricBundle, PipelineEvent},
-    pipeline::{LabelMetric, Metric},
+    pipeline::{LabelMetric, Metric, PipelineSender},
     provenance::ContextProvenance,
     semantic::Provenance,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, OnceCell};
+use tokio::sync::OnceCell;
 
 const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const CONTEXT_VERSION: &str = "1.0";
+const PROVIDER: &str = "groq";
 
 /// Current recommended fast Groq model.
 /// Update this when Groq deprecates models.
@@ -57,8 +57,7 @@ pub struct ContextConfig {
 
 impl Default for ContextConfig {
     fn default() -> Self {
-        let model = std::env::var("GLS_GROQ_MODEL")
-            .unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let model = std::env::var("GLS_GROQ_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         Self {
             api_key: std::env::var("GROQ_API_KEY").ok(),
             model,
@@ -102,18 +101,29 @@ impl Contextualiser {
     pub async fn contextualise(
         &self,
         descriptors: Vec<Descriptor>,
-        tx: broadcast::Sender<PipelineEvent>,
+        tx: PipelineSender,
     ) {
         // ── Pre-flight ────────────────────────────────────────────────────────
-        match self.preflight().await {
-            Err(reason) => {
-                let _ = tx.send(PipelineEvent::ProviderUnavailable {
-                    provider: "groq".to_string(),
-                    reason,
-                });
-                return;
-            }
-            Ok(_) => {}
+        if let Err(reason) = self.preflight().await {
+            let _ = tx.send(PipelineEvent::ProviderUnavailable {
+                provider: PROVIDER.to_string(),
+                reason,
+            });
+            return;
+        }
+
+        // ── Announce the whole queue up front ───────────────────────────────────
+        // Emitted before any processing starts so consumers can show queue
+        // position / ETA immediately, rather than a generic "pending" state
+        // for however long it takes this sequential loop to reach them.
+        let total = descriptors.len() as u32;
+        for (i, desc) in descriptors.iter().enumerate() {
+            let _ = tx.send(PipelineEvent::ContextQueued {
+                path: desc.path.clone(),
+                position: i as u32,
+                total,
+                provider: PROVIDER.to_string(),
+            });
         }
 
         // ── Per-object contextualisation ──────────────────────────────────────
@@ -207,7 +217,7 @@ impl Contextualiser {
             .send()
             .await
         {
-            Ok(r)  => r,
+            Ok(r) => r,
             Err(e) => return ProbeResult::NetworkError(e.to_string()),
         };
 
@@ -281,7 +291,7 @@ impl Contextualiser {
         let provenance = ContextProvenance {
             context_version: CONTEXT_VERSION.to_string(),
             model: model.clone(),
-            provider: "groq".to_string(),
+            provider: PROVIDER.to_string(),
             descriptor_hash,
             source_hash: desc.source_hash.clone(),
             timestamp: now,
@@ -320,7 +330,7 @@ fn build_prompt(desc: &Descriptor) -> String {
     )
 }
 
-fn extract_metrics(path: &PathBuf, parsed: &serde_json::Value) -> MetricBundle {
+fn extract_metrics(path: &std::path::Path, parsed: &serde_json::Value) -> MetricBundle {
     let scalar = |key: &str| -> Option<Metric> {
         let obj = parsed.get(key)?;
         Some(Metric {
@@ -349,7 +359,7 @@ fn extract_metrics(path: &PathBuf, parsed: &serde_json::Value) -> MetricBundle {
     };
 
     MetricBundle {
-        path: path.clone(),
+        path: path.to_path_buf(),
         completeness: scalar("completeness"),
         quality: scalar("quality"),
         accuracy: scalar("accuracy"),

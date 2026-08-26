@@ -10,6 +10,7 @@ members = [
     "crates/gls-context",
     "crates/gls-metrics",
     "crates/gls-padagonia",
+    "crates/gls-provider",
     "crates/gls-render",
     "bin/gls",
 ]
