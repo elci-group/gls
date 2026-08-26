@@ -6,5 +6,3 @@ edition.workspace = true
 [dependencies]
 gls-core    = { path = "../gls-core" }
 tokio       = { version = "1", features = ["full"] }
-infer       = "0.16"
-thiserror   = "1"

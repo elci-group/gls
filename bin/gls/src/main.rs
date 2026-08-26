@@ -72,13 +72,17 @@ struct Cli {
     #[arg(long = "grid", action = ArgAction::SetTrue)]
     grid: bool,
 
-    /// Skip AI contextualisation.
-    #[arg(long = "no-context", action = ArgAction::SetTrue)]
+    /// Skip remote AI contextualisation (the default; retained for compatibility).
+    #[arg(long = "no-context", action = ArgAction::SetTrue, conflicts_with = "context")]
     no_context: bool,
 
-    /// Force AI contextualisation even when cache is valid.
+    /// Enable remote AI contextualisation of non-credential file excerpts.
     #[arg(long = "context", action = ArgAction::SetTrue)]
-    force_context: bool,
+    context: bool,
+
+    /// Refresh remote context even when the persisted descriptor is unchanged.
+    #[arg(long, action = ArgAction::SetTrue, requires = "context")]
+    refresh_context: bool,
 
     /// Deep scan: increase depth and contextualisation budget.
     #[arg(long, action = ArgAction::SetTrue)]
@@ -181,8 +185,8 @@ async fn main() {
         } else {
             cli.depth
         },
-        no_context: cli.no_context,
-        incremental: !cli.force_context,
+        no_context: cli.no_context || !cli.context,
+        incremental: !cli.refresh_context,
         max_context_candidates: if cli.deep { 256 } else { 64 },
         inference_budget_bytes: if cli.deep { 1_024_000 } else { 256_000 },
         ..Default::default()
@@ -355,6 +359,10 @@ async fn main() {
         let mut ctx_config = ContextConfig::default();
         if let Some(ref m) = cli.model {
             ctx_config.model = m.clone();
+        } else if let Some((provider, model, _)) = padagonia_query.selected_provider() {
+            if provider == "groq" {
+                ctx_config.model = model;
+            }
         }
 
         let contextualiser = Contextualiser::new(ctx_config);
