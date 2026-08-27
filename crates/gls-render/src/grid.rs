@@ -255,12 +255,12 @@ fn cell(state: &EntryDisplayState, queue: &QueueTracker, color: bool) -> (String
     let icon = entry_icon(state);
     let size = human_bytes(state.measured_bytes());
 
-    let status_plain = live_status_line(state, queue, false, GRID_CONTEXT_MAX_CHARS, false);
+    let status_plain = live_status_line(state, queue, GRID_CONTEXT_MAX_CHARS, false);
     let plain = format!("{icon} {} {size} \u{b7} {status_plain}", state.basename);
     let plain_w = UnicodeWidthStr::width(plain.as_str());
 
     let rendered = if color {
-        let status = live_status_line(state, queue, false, GRID_CONTEXT_MAX_CHARS, true);
+        let status = live_status_line(state, queue, GRID_CONTEXT_MAX_CHARS, true);
         format!(
             "{icon} {} {} {} {status}",
             bold(&state.basename),

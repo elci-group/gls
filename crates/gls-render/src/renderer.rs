@@ -545,20 +545,12 @@ fn context_carousel_frame(
 /// Nothing is held back waiting for a rotation timer, and nothing waits on
 /// any other entry — this reflects exactly what's known about `state` right
 /// now. Used for grid cells, where a compact single-line summary is needed:
-/// - `roomy` picks the full-detail fragments (BART size folded into the
-///   type fragment, full `target_market` label in the metrics fragment)
-///   for row mode, vs. compact ones for grid cells — a grid cell sits
-///   side-by-side with others in the same category block, so a single
-///   free-text sentence there can blow the whole column out past the
-///   point of fitting more than one per row.
 /// - `context_max_chars` bounds how much of a context summary to show
-///   before truncating — grid cells need a tighter budget than a full-width
-///   row.
+///   before truncating.
 /// - `color` picks ANSI-coloured vs. plain text.
 pub(crate) fn live_status_line(
     state: &EntryDisplayState,
     queue: &QueueTracker,
-    roomy: bool,
     context_max_chars: usize,
     color: bool,
 ) -> String {
@@ -566,11 +558,10 @@ pub(crate) fn live_status_line(
 
     // Type layer.
     if let Some(ref cls) = state.classification {
-        dims.push(match (roomy, color) {
-            (true, true) => type_line(cls, state.physical.as_ref()),
-            (true, false) => type_line_plain(cls, state.physical.as_ref()),
-            (false, true) => type_fragment(cls),
-            (false, false) => type_fragment_plain(cls),
+        dims.push(if color {
+            type_fragment(cls)
+        } else {
+            type_fragment_plain(cls)
         });
     } else {
         dims.push(loading_line(state, "type", color));
@@ -578,11 +569,10 @@ pub(crate) fn live_status_line(
 
     // Metrics layer.
     if let Some(ref m) = state.metrics {
-        let line = match (roomy, color) {
-            (true, true) => metrics_line(m),
-            (true, false) => metrics_line_plain(m),
-            (false, true) => metrics_fragment(m),
-            (false, false) => metrics_fragment_plain(m),
+        let line = if color {
+            metrics_fragment(m)
+        } else {
+            metrics_fragment_plain(m)
         };
         if !line.is_empty() {
             dims.push(line);
@@ -624,8 +614,10 @@ pub(crate) fn live_status_line(
 
 /// A compact progress item for an unfinished insight layer.
 fn loading_line(state: &EntryDisplayState, layer: &str, color: bool) -> String {
-    // Offset the layers so a listing shows a small array of moving markers
-    // rather than three identical glyphs on every tick.
+    // `spinner_index` advances every tick independently of the carousel
+    // frame, so a loading indicator keeps moving even when its layer is
+    // off-screen. Offsets keep multiple simultaneous loaders visually
+    // distinct (e.g. in grid mode).
     const FRAMES: [&str; 4] = ["◌", "◍", "●", "◍"];
     let offset = match layer {
         "type" => 0,
