@@ -803,3 +803,78 @@ fn apply_event(
         PipelineEvent::PipelineComplete => { /* handled by caller */ }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gls_core::semantic::{Classification, SemanticType};
+    use std::path::PathBuf;
+
+    fn test_state(frame_index: usize) -> EntryDisplayState {
+        let mut s = EntryDisplayState::new(
+            PathBuf::from("/tmp/demo.rs"),
+            "demo.rs".to_string(),
+            false,
+        );
+        s.frame_index = frame_index;
+        s
+    }
+
+    #[test]
+    fn carousel_frame_zero_is_name_only() {
+        let state = test_state(0);
+        let queue = QueueTracker::default();
+        assert!(carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false).is_none());
+    }
+
+    #[test]
+    fn carousel_frame_one_shows_type_loader_when_unclassified() {
+        let state = test_state(1);
+        let queue = QueueTracker::default();
+        let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
+            .expect("frame 1 should have a sub-line");
+        assert!(line.contains("thinking type"));
+    }
+
+    #[test]
+    fn carousel_frame_one_shows_classification_when_ready() {
+        let mut state = test_state(1);
+        state.classification = Some(Classification {
+            semantic_type: SemanticType::SourceCode,
+            confidence: 1.0,
+            evidence: vec![],
+            language: Some("Rust".to_string()),
+        });
+        let queue = QueueTracker::default();
+        let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
+            .expect("frame 1 should have a sub-line");
+        assert!(!line.contains("thinking type"));
+    }
+
+    #[test]
+    fn carousel_frame_two_shows_metrics_loader_when_missing() {
+        let state = test_state(2);
+        let queue = QueueTracker::default();
+        let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
+            .expect("frame 2 should have a sub-line");
+        assert!(line.contains("thinking metrics"));
+    }
+
+    #[test]
+    fn carousel_frame_three_shows_context_placeholder_when_not_applicable() {
+        let state = test_state(3);
+        let queue = QueueTracker::default();
+        let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
+            .expect("frame 3 should have a sub-line");
+        assert_eq!(line, "—");
+    }
+
+    #[test]
+    fn spinner_index_advances_independently_of_carousel_frame() {
+        let mut state = test_state(1);
+        state.spinner_index = 0;
+        state.tick_frame();
+        assert_eq!(state.frame_index, 2);
+        assert_eq!(state.spinner_index, 1);
+    }
+}
