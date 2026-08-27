@@ -23,8 +23,12 @@ pub struct EntryDisplayState {
     pub context: Option<ContextAnnotation>,
     pub metrics: Option<MetricBundle>,
     pub presentation: PresentationState,
-    /// Which animation frame (dimension) is currently shown.
+    /// Which carousel frame (identity, type, metrics, context) is currently
+    /// shown in row-mode TTY output.
     pub frame_index: usize,
+    /// Spinner animation phase, advanced independently of the carousel frame
+    /// so a loading indicator keeps moving even when its layer is off-screen.
+    pub spinner_index: usize,
     /// True while a ContextStarted has been received but no result yet.
     pub context_pending: bool,
     /// True if contextualisation failed (provider error, etc.).
@@ -46,12 +50,14 @@ impl EntryDisplayState {
             metrics: None,
             presentation: PresentationState::Discovered,
             frame_index: 0,
+            spinner_index: 0,
             context_pending: false,
             context_failed: false,
         }
     }
 
-    /// Advance to the next animation frame independently of pipeline state.
+    /// Advance to the next carousel frame and spinner phase independently of
+    /// pipeline state.
     pub fn tick_frame(&mut self) {
         // The carousel always has one item per insight layer (type, metrics,
         // context), plus the name-only frame. Keeping this fixed means pending
@@ -59,6 +65,7 @@ impl EntryDisplayState {
         // swapped in without resetting the carousel.
         const TOTAL_FRAMES: usize = 4;
         self.frame_index = (self.frame_index + 1) % TOTAL_FRAMES;
+        self.spinner_index = (self.spinner_index + 1) % TOTAL_FRAMES;
     }
 
     /// Best-available byte size for this entry: BART's measured directory

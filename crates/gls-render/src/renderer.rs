@@ -446,26 +446,105 @@ fn retained_render(
 
 // ── Row rendering ─────────────────────────────────────────────────────────────
 
-/// Build the rendered representation of one entry for the current frame.
+/// Build the rendered representation of one entry for the current carousel
+/// frame.
 fn render_row(state: &EntryDisplayState, queue: &QueueTracker) -> RenderedRow {
     let icon = entry_icon(state);
     let name = bold(&state.basename);
     let primary = format!("{icon} {name}");
-    let secondary = Some(live_status_line(
-        state,
-        queue,
-        true,
-        ROW_CONTEXT_MAX_CHARS,
-        true,
-    ));
+    let secondary = carousel_frame(state, queue, ROW_CONTEXT_MAX_CHARS, true);
     RenderedRow { primary, secondary }
+}
+
+/// Build one carousel frame for the row-mode sub-line.
+///
+/// The carousel has four fixed frames:
+///   0 → name only (no secondary line)
+///   1 → type layer
+///   2 → metrics layer
+///   3 → context layer
+///
+/// Keeping the frame count fixed means pending loaders animate before any
+/// result arrives and completed results can replace their loading spinner
+/// without resetting the carousel position.
+fn carousel_frame(
+    state: &EntryDisplayState,
+    queue: &QueueTracker,
+    context_max_chars: usize,
+    color: bool,
+) -> Option<String> {
+    match state.frame_index % 4 {
+        0 => None,
+        1 => Some(type_carousel_frame(state, color)),
+        2 => Some(metrics_carousel_frame(state, color)),
+        3 => Some(context_carousel_frame(state, queue, context_max_chars, color)),
+        _ => unreachable!(),
+    }
+}
+
+fn type_carousel_frame(state: &EntryDisplayState, color: bool) -> String {
+    if let Some(ref cls) = state.classification {
+        if color {
+            type_line(cls, state.physical.as_ref())
+        } else {
+            type_line_plain(cls, state.physical.as_ref())
+        }
+    } else {
+        loading_line(state, "type", color)
+    }
+}
+
+fn metrics_carousel_frame(state: &EntryDisplayState, color: bool) -> String {
+    if let Some(ref m) = state.metrics {
+        let line = if color {
+            metrics_line(m)
+        } else {
+            metrics_line_plain(m)
+        };
+        if !line.is_empty() {
+            line
+        } else {
+            loading_line(state, "metrics", color)
+        }
+    } else {
+        loading_line(state, "metrics", color)
+    }
+}
+
+fn context_carousel_frame(
+    state: &EntryDisplayState,
+    queue: &QueueTracker,
+    context_max_chars: usize,
+    color: bool,
+) -> String {
+    if let Some(ref ctx) = state.context {
+        if color {
+            context_line(ctx, context_max_chars)
+        } else {
+            context_line_plain(ctx, context_max_chars)
+        }
+    } else if state.context_failed {
+        let msg = "⚠ context unavailable";
+        if color { dim(msg) } else { msg.to_string() }
+    } else if state.context_pending {
+        loading_line(state, "context", color)
+    } else if let Some(q) = queue.status_for(&state.path) {
+        let msg = format!(
+            "in line for {}, position {} of {} \u{b7} eta {}s",
+            q.provider, q.position, q.total, q.eta_secs
+        );
+        if color { dim(&msg) } else { msg }
+    } else {
+        let msg = "—";
+        if color { dim(msg) } else { msg.to_string() }
+    }
 }
 
 /// Build the current status line for one entry: every completed insight
 /// layer's result, joined together immediately as each becomes available.
 /// Nothing is held back waiting for a rotation timer, and nothing waits on
 /// any other entry — this reflects exactly what's known about `state` right
-/// now. Shared between the row-mode sub-line and grid cells:
+/// now. Used for grid cells, where a compact single-line summary is needed:
 /// - `roomy` picks the full-detail fragments (BART size folded into the
 ///   type fragment, full `target_market` label in the metrics fragment)
 ///   for row mode, vs. compact ones for grid cells — a grid cell sits
@@ -553,7 +632,7 @@ fn loading_line(state: &EntryDisplayState, layer: &str, color: bool) -> String {
         "metrics" => 1,
         _ => 2,
     };
-    let marker = FRAMES[(state.frame_index + offset) % FRAMES.len()];
+    let marker = FRAMES[(state.spinner_index + offset) % FRAMES.len()];
     let label = match layer {
         "type" => "thinking type",
         "metrics" => "thinking metrics",
