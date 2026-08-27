@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 gls-core    = { path = "../gls-core" }
+form3       = { path = "../../../3form" }
 tokio       = { version = "1", features = ["full"] }
 crossterm   = "0.27"
 serde_json  = "1"

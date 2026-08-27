@@ -563,11 +563,11 @@ fn loading_line(state: &EntryDisplayState, layer: &str, color: bool) -> String {
         return format!("{marker} {label}");
     }
     let colour = match layer {
-        "type" => "\x1b[33m",    // yellow
-        "metrics" => "\x1b[32m", // green
-        _ => "\x1b[35m",         // magenta
+        "type" => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Yellow, false)),
+        "metrics" => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Green, false)),
+        _ => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Magenta, false)),
     };
-    format!("{colour}{marker}\x1b[0m {label}")
+    format!("{colour}{marker}{} {label}", form3::ansi::reset())
 }
 
 /// Best sub-line for plain (non-animated) output. This prints once, after

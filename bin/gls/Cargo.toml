@@ -18,6 +18,7 @@ gls-context    = { path = "../../crates/gls-context" }
 gls-padagonia  = { path = "../../crates/gls-padagonia" }
 gls-provider   = { path = "../../crates/gls-provider" }
 gls-render     = { path = "../../crates/gls-render" }
+form3          = { path = "../../../3form" }
 tokio          = { version = "1", features = ["full"] }
 clap           = { version = "4", features = ["derive"] }
 serde_json     = "1"

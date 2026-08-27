@@ -4,23 +4,41 @@ use gls_core::event::{ContextAnnotation, MetricBundle, PhysicalMeasure};
 use gls_core::semantic::Classification;
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
+// Generated through `form3::ansi` rather than formatted here directly, so the
+// escape bytes come from one shared, tested source.
 
-const RESET: &str = "\x1b[0m";
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
-const GREEN: &str = "\x1b[32m";
-const MAGENTA: &str = "\x1b[35m";
+use form3::ansi::{fg, reset, sgr, AnsiColor, Attr, Color};
+
+fn code_reset() -> &'static str {
+    reset()
+}
+fn code_dim() -> String {
+    sgr(Attr::Dim)
+}
+fn code_bold() -> String {
+    sgr(Attr::Bold)
+}
+fn code_cyan() -> String {
+    fg(&AnsiColor::Standard(Color::Cyan, false))
+}
+fn code_yellow() -> String {
+    fg(&AnsiColor::Standard(Color::Yellow, false))
+}
+fn code_green() -> String {
+    fg(&AnsiColor::Standard(Color::Green, false))
+}
+fn code_magenta() -> String {
+    fg(&AnsiColor::Standard(Color::Magenta, false))
+}
 
 /// Format a filename in bold.
 pub fn bold(s: &str) -> String {
-    format!("{BOLD}{s}{RESET}")
+    format!("{}{s}{}", code_bold(), code_reset())
 }
 
 /// Format a string as dim (annotation text).
 pub fn dim(s: &str) -> String {
-    format!("{DIM}{s}{RESET}")
+    format!("{}{s}{}", code_dim(), code_reset())
 }
 
 /// Format a byte count to a human-readable string.
@@ -49,15 +67,22 @@ pub fn type_line(cls: &Classification, phys: Option<&PhysicalMeasure>) -> String
     let size = phys
         .map(|p| {
             let bytes = p.tree_bytes.unwrap_or(p.logical_bytes);
-            format!(" {DIM}·{RESET} {CYAN}{}{RESET}", human_bytes(bytes))
+            format!(
+                " {}·{} {}{}{}",
+                code_dim(),
+                code_reset(),
+                code_cyan(),
+                human_bytes(bytes),
+                code_reset()
+            )
         })
         .unwrap_or_default();
     let lang = cls
         .language
         .as_deref()
-        .map(|l| format!(" {DIM}[{l}]{RESET}"))
+        .map(|l| format!(" {}[{l}]{}", code_dim(), code_reset()))
         .unwrap_or_default();
-    format!("{YELLOW}{type_label}{RESET}{lang}{size}")
+    format!("{}{type_label}{}{lang}{size}", code_yellow(), code_reset())
 }
 
 /// One-line type + size annotation (plain, no ANSI).
@@ -80,7 +105,7 @@ pub fn type_fragment(cls: &Classification) -> String {
         .language
         .as_deref()
         .unwrap_or_else(|| cls.semantic_type.label());
-    format!("{YELLOW}{label}{RESET}")
+    format!("{}{label}{}", code_yellow(), code_reset())
 }
 
 /// `type_fragment`, plain (no ANSI).
@@ -93,7 +118,12 @@ pub fn type_fragment_plain(cls: &Classification) -> String {
 
 /// One-line context summary (coloured), truncated to `max_chars`.
 pub fn context_line(ann: &ContextAnnotation, max_chars: usize) -> String {
-    format!("{MAGENTA}\"{}\"{RESET}", truncate(&ann.summary, max_chars))
+    format!(
+        "{}\"{}\"{}",
+        code_magenta(),
+        truncate(&ann.summary, max_chars),
+        code_reset()
+    )
 }
 
 /// One-line context summary (plain, no ANSI), truncated to `max_chars`.
@@ -114,23 +144,21 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 
 /// One-line metrics summary (coloured).
 pub fn metrics_line(m: &MetricBundle) -> String {
+    let (green, dim, reset) = (code_green(), code_dim(), code_reset());
     let mut parts = Vec::new();
     if let Some(ref c) = m.completeness {
-        parts.push(format!(
-            "{GREEN}completeness {:.0}%{RESET}",
-            c.score * 100.0
-        ));
+        parts.push(format!("{green}completeness {:.0}%{reset}", c.score * 100.0));
     }
     if let Some(ref q) = m.quality {
-        parts.push(format!("{GREEN}quality {:.0}%{RESET}", q.score * 100.0));
+        parts.push(format!("{green}quality {:.0}%{reset}", q.score * 100.0));
     }
     if let Some(ref a) = m.accuracy {
-        parts.push(format!("{GREEN}accuracy {:.0}%{RESET}", a.score * 100.0));
+        parts.push(format!("{green}accuracy {:.0}%{reset}", a.score * 100.0));
     }
     if let Some(ref t) = m.target_market {
-        parts.push(format!("{DIM}→ {}{RESET}", t.value));
+        parts.push(format!("{dim}→ {}{reset}", t.value));
     }
-    parts.join(&format!(" {DIM}·{RESET} "))
+    parts.join(&format!(" {dim}·{reset} "))
 }
 
 /// One-line metrics summary (plain, no ANSI).
@@ -157,15 +185,16 @@ pub fn metrics_line_plain(m: &MetricBundle) -> String {
 /// column out past the point of fitting side-by-side with others, so grid
 /// cells drop it (`metrics_line`'s callers still show it in full).
 pub fn metrics_fragment(m: &MetricBundle) -> String {
+    let (green, reset) = (code_green(), code_reset());
     let mut parts = Vec::new();
     if let Some(ref c) = m.completeness {
-        parts.push(format!("{GREEN}{:.0}%c{RESET}", c.score * 100.0));
+        parts.push(format!("{green}{:.0}%c{reset}", c.score * 100.0));
     }
     if let Some(ref q) = m.quality {
-        parts.push(format!("{GREEN}{:.0}%q{RESET}", q.score * 100.0));
+        parts.push(format!("{green}{:.0}%q{reset}", q.score * 100.0));
     }
     if let Some(ref a) = m.accuracy {
-        parts.push(format!("{GREEN}{:.0}%a{RESET}", a.score * 100.0));
+        parts.push(format!("{green}{:.0}%a{reset}", a.score * 100.0));
     }
     parts.join(" ")
 }

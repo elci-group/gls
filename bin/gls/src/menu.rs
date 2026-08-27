@@ -120,7 +120,13 @@ fn redraw(stdout: &mut io::Stdout, items: &[MenuItem], selected: usize) {
 
 fn render_item(item: &MenuItem, active: bool) -> String {
     if active {
-        format!("\x1b[7m\u{25b8} {}  {}\x1b[0m", item.label, item.hint)
+        format!(
+            "{}\u{25b8} {}  {}{}",
+            form3::ansi::sgr(form3::ansi::Attr::Reverse),
+            item.label,
+            item.hint,
+            form3::ansi::reset()
+        )
     } else {
         format!("  {}  {}", item.label, item.hint)
     }

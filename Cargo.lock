@@ -320,6 +320,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "form3"
+version = "0.1.0"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,6 +408,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "form3",
  "gls-bart",
  "gls-bound",
  "gls-context",
@@ -523,6 +528,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "form3",
  "gls-core",
  "libc",
  "serde_json",
