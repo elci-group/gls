@@ -62,8 +62,8 @@ fn render_tool(name: &str, p: &ToolProgress, color: bool) -> String {
         .message
         .as_ref()
         .map(|m| {
-            let truncated = if m.chars().count() > 20 {
-                format!("{}…", m.chars().take(19).collect::<String>())
+            let truncated = if m.chars().count() > 12 {
+                format!("{}…", m.chars().take(11).collect::<String>())
             } else {
                 m.clone()
             };
