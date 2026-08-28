@@ -63,6 +63,11 @@ pub struct PadagoniaConfig {
 
 impl Default for PadagoniaConfig {
     fn default() -> Self {
+        if let Some(db_path) = std::env::var_os("GLS_PADAGONIA_DB") {
+            return Self {
+                db_path: PathBuf::from(db_path),
+            };
+        }
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         Self {
             db_path: PathBuf::from(home).join(".local/share/gls/padagonia.db"),
