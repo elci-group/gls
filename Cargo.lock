@@ -504,9 +504,11 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "gls-core",
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]

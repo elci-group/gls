@@ -776,6 +776,7 @@ fn apply_event(
                 slot.insert(s);
             }
         }
+        PipelineEvent::CacheStatus { .. } => { /* telemetry-only */ }
 
         PipelineEvent::OrderUpdated { paths } => {
             let mut seen = std::collections::HashSet::new();

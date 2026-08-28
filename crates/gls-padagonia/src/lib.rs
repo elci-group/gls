@@ -4,4 +4,6 @@
 //! revision is appended rather than overwriting, enabling historical queries.
 
 mod store;
-pub use store::{CachedModel, Padagonia, PadagoniaConfig, SizeAggregateRecord};
+pub use store::{
+    CachedModel, CachedSnapshot, Padagonia, PadagoniaConfig, SizeAggregateRecord,
+};

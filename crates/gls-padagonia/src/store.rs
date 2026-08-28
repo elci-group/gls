@@ -2,10 +2,15 @@
 
 use chrono::{DateTime, Utc};
 use gls_core::{
-    event::{ContextAnnotation, Descriptor, MetricBundle, PipelineEvent, SizeAggregate},
+    entry::FsEntry,
+    event::{
+        ContextAnnotation, Descriptor, MetricBundle, PhysicalMeasure, PipelineEvent, SizeAggregate,
+    },
     pipeline::PipelineReceiver,
+    semantic::Classification,
 };
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +34,24 @@ pub struct SizeAggregateRecord {
     pub reclaimable_fraction: Option<f32>,
     pub is_leaf: bool,
     pub measured_at: DateTime<Utc>,
+}
+
+/// A complete deterministic analysis snapshot, optionally enriched with the
+/// latest matching natural-language context and metrics revision.
+#[derive(Debug, Clone)]
+pub struct CachedSnapshot {
+    pub entry: FsEntry,
+    pub classification: Classification,
+    pub measurement: PhysicalMeasure,
+    pub descriptor: Descriptor,
+    pub context: Option<ContextAnnotation>,
+    pub metrics: Option<MetricBundle>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub last_accessed: DateTime<Utc>,
+    pub access_count: u64,
+    pub metadata_change_count: u64,
+    pub content_change_count: u64,
 }
 
 /// Configuration for the Padagonia store.
@@ -116,8 +139,201 @@ impl Padagonia {
                  measured_at           TEXT    NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_size_parent
-                 ON size_aggregates(parent_path);",
+                 ON size_aggregates(parent_path);
+             CREATE TABLE IF NOT EXISTS entry_snapshots (
+                 path                  TEXT PRIMARY KEY,
+                 identity_fingerprint  TEXT NOT NULL,
+                 analysis_version      TEXT NOT NULL,
+                 entry_json            TEXT NOT NULL,
+                 classification_json   TEXT NOT NULL,
+                 measurement_json      TEXT NOT NULL,
+                 descriptor_json       TEXT NOT NULL,
+                 source_hash           TEXT,
+                 format                TEXT,
+                 computation_kind      TEXT NOT NULL,
+                 sources_json          TEXT NOT NULL,
+                 first_seen            TEXT NOT NULL,
+                 last_seen             TEXT NOT NULL,
+                 last_accessed         TEXT NOT NULL,
+                 access_count          INTEGER NOT NULL DEFAULT 0,
+                 metadata_change_count INTEGER NOT NULL DEFAULT 0,
+                 content_change_count  INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_snapshot_identity
+                 ON entry_snapshots(path, identity_fingerprint, analysis_version);
+             CREATE TABLE IF NOT EXISTS entry_access_history (
+                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                 path                  TEXT NOT NULL,
+                 observed_at           TEXT NOT NULL,
+                 cache_hit             INTEGER NOT NULL,
+                 identity_fingerprint  TEXT NOT NULL,
+                 scan_root             TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_access_path_ts
+                 ON entry_access_history(path, observed_at DESC);",
         )
+    }
+
+    /// Cheap identity for change detection. Files include nanosecond metadata;
+    /// directories also include their immediate child names and stat metadata,
+    /// catching membership and common direct-child changes without a deep walk.
+    pub fn identity_fingerprint(entry: &FsEntry) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"gls-fs-identity-v1\0");
+        hasher.update(entry.path.to_string_lossy().as_bytes());
+        if let Ok(meta) = std::fs::symlink_metadata(&entry.path) {
+            hash_metadata(&mut hasher, &meta);
+        } else {
+            hasher.update(b"missing");
+        }
+        if entry.path.is_dir() {
+            let mut children = std::fs::read_dir(&entry.path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect::<Vec<_>>();
+            children.sort_by_key(|child| child.file_name());
+            for child in children {
+                hasher.update(child.file_name().to_string_lossy().as_bytes());
+                if let Ok(meta) = child.metadata() {
+                    hash_metadata(&mut hasher, &meta);
+                }
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Load a snapshot only when both filesystem identity and the analysis
+    /// schema match. Every lookup records aggregate and append-only access
+    /// history, including misses.
+    pub fn lookup_snapshot(
+        &self,
+        entry: &FsEntry,
+        analysis_version: &str,
+        scan_root: &Path,
+    ) -> Option<CachedSnapshot> {
+        let fingerprint = Self::identity_fingerprint(entry);
+        let now = Utc::now().to_rfc3339();
+        let path = entry.path.to_string_lossy().to_string();
+        let root = scan_root.to_string_lossy().to_string();
+        let conn = self.conn.lock().unwrap();
+
+        let row = conn.query_row(
+            "SELECT entry_json, classification_json, measurement_json,
+                    descriptor_json, first_seen, last_seen, last_accessed,
+                    access_count, metadata_change_count, content_change_count
+             FROM entry_snapshots
+             WHERE path = ?1 AND identity_fingerprint = ?2 AND analysis_version = ?3",
+            params![path, fingerprint, analysis_version],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?, row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?, row.get::<_, i64>(9)?,
+                ))
+            },
+        ).ok();
+        let hit = row.is_some();
+
+        let _ = conn.execute(
+            "INSERT INTO entry_access_history
+             (path, observed_at, cache_hit, identity_fingerprint, scan_root)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![path, now, hit as i32, fingerprint, root],
+        );
+        if hit {
+            let _ = conn.execute(
+                "UPDATE entry_snapshots SET last_seen = ?2, last_accessed = ?2,
+                    access_count = access_count + 1 WHERE path = ?1",
+                params![path, now],
+            );
+        }
+
+        let (entry_json, classification_json, measurement_json, descriptor_json,
+             first_seen, last_seen, last_accessed, access_count,
+             metadata_change_count, content_change_count) = row?;
+        let descriptor: Descriptor = serde_json::from_str(&descriptor_json).ok()?;
+        let (context, metrics) = latest_context_locked(&conn, &entry.path, &descriptor.descriptor_hash);
+        Some(CachedSnapshot {
+            entry: serde_json::from_str(&entry_json).ok()?,
+            classification: serde_json::from_str(&classification_json).ok()?,
+            measurement: serde_json::from_str(&measurement_json).ok()?,
+            descriptor,
+            context,
+            metrics,
+            first_seen: parse_time(&first_seen),
+            last_seen: parse_time(&last_seen),
+            last_accessed: parse_time(&last_accessed),
+            access_count: access_count as u64 + 1,
+            metadata_change_count: metadata_change_count as u64,
+            content_change_count: content_change_count as u64,
+        })
+    }
+
+    /// Upsert deterministic metadata from DISCOVER, TYPE, BART and INDEX.
+    pub fn store_snapshot(
+        &self,
+        entry: &FsEntry,
+        classification: &Classification,
+        measurement: &PhysicalMeasure,
+        descriptor: &Descriptor,
+        analysis_version: &str,
+    ) -> Result<(), String> {
+        let fingerprint = Self::identity_fingerprint(entry);
+        let now = Utc::now().to_rfc3339();
+        let path = entry.path.to_string_lossy().to_string();
+        let format = entry.path.extension().map(|ext| ext.to_string_lossy().to_lowercase());
+        let entry_json = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+        let classification_json = serde_json::to_string(classification).map_err(|e| e.to_string())?;
+        let measurement_json = serde_json::to_string(measurement).map_err(|e| e.to_string())?;
+        let descriptor_json = serde_json::to_string(descriptor).map_err(|e| e.to_string())?;
+        let sources_json = serde_json::to_string(&["discover", "gls-type", "bart", "gls-index"])
+            .map_err(|e| e.to_string())?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO entry_snapshots
+             (path, identity_fingerprint, analysis_version, entry_json,
+              classification_json, measurement_json, descriptor_json,
+              source_hash, format, computation_kind, sources_json, first_seen,
+              last_seen, last_accessed, access_count, metadata_change_count,
+              content_change_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'deterministic',?10,?11,?11,?11,0,0,0)
+             ON CONFLICT(path) DO UPDATE SET
+                 identity_fingerprint = excluded.identity_fingerprint,
+                 analysis_version = excluded.analysis_version,
+                 entry_json = excluded.entry_json,
+                 classification_json = excluded.classification_json,
+                 measurement_json = excluded.measurement_json,
+                 descriptor_json = excluded.descriptor_json,
+                 source_hash = excluded.source_hash,
+                 format = excluded.format,
+                 sources_json = excluded.sources_json,
+                 last_seen = excluded.last_seen,
+                 last_accessed = excluded.last_accessed,
+                 metadata_change_count = entry_snapshots.metadata_change_count +
+                     CASE WHEN entry_snapshots.identity_fingerprint <> excluded.identity_fingerprint THEN 1 ELSE 0 END,
+                 content_change_count = entry_snapshots.content_change_count +
+                     CASE WHEN COALESCE(entry_snapshots.source_hash, '') <> COALESCE(excluded.source_hash, '') THEN 1 ELSE 0 END",
+            params![path, fingerprint, analysis_version, entry_json, classification_json,
+                    measurement_json, descriptor_json, descriptor.source_hash, format,
+                    sources_json, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Retrieve the latest natural-language context whose descriptor still
+    /// matches the current deterministic analysis.
+    pub fn cached_context(
+        &self,
+        path: &Path,
+        descriptor_hash: &str,
+    ) -> Option<(ContextAnnotation, Option<MetricBundle>)> {
+        let conn = self.conn.lock().unwrap();
+        let (context, metrics) = latest_context_locked(&conn, path, descriptor_hash);
+        context.map(|annotation| (annotation, metrics))
     }
 
     /// Persist a context annotation and associated metrics.
@@ -414,6 +630,11 @@ impl Padagonia {
         loop {
             match rx.recv().await {
                 Some(event) => match event {
+                    PipelineEvent::CacheStatus { path, hit: true } => {
+                        // Hydrated events that follow are display-only. Marking
+                        // the path persisted prevents duplicate revisions.
+                        persisted.insert(path);
+                    }
                     PipelineEvent::Indexed(d) => {
                         descriptors.insert(d.path.clone(), d);
                     }
@@ -513,4 +734,85 @@ fn row_to_size_aggregate(row: &rusqlite::Row) -> rusqlite::Result<SizeAggregateR
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
+}
+
+fn parse_time(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn hash_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update([metadata.is_file() as u8, metadata.is_dir() as u8]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.mode().to_le_bytes());
+        hasher.update(metadata.mtime().to_le_bytes());
+        hasher.update(metadata.mtime_nsec().to_le_bytes());
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                hasher.update(duration.as_nanos().to_le_bytes());
+            }
+        }
+        hasher.update([metadata.permissions().readonly() as u8]);
+    }
+}
+
+fn latest_context_locked(
+    conn: &Connection,
+    path: &Path,
+    descriptor_hash: &str,
+) -> (Option<ContextAnnotation>, Option<MetricBundle>) {
+    let row = conn.query_row(
+        "SELECT source_hash, descriptor_hash, model, provider, context_version,
+                summary, purpose, role, relationships, metrics_json, timestamp
+         FROM context_revisions
+         WHERE path = ?1 AND descriptor_hash = ?2
+         ORDER BY timestamp DESC LIMIT 1",
+        params![path.to_string_lossy().as_ref(), descriptor_hash],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?, row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        },
+    ).ok();
+
+    let Some((source_hash, descriptor_hash, model, provider, context_version,
+              summary, purpose, role, relationships_json, metrics_json, timestamp)) = row else {
+        return (None, None);
+    };
+    let annotation = ContextAnnotation {
+        path: path.to_path_buf(),
+        summary,
+        purpose,
+        role,
+        relationships: serde_json::from_str(&relationships_json).unwrap_or_default(),
+        provenance: gls_core::provenance::ContextProvenance {
+            context_version,
+            model,
+            provider,
+            descriptor_hash,
+            source_hash,
+            timestamp: parse_time(&timestamp),
+            // Older Padagonia schemas did not store this field. The cached
+            // text remains valid; confidence is conservatively unknown.
+            confidence: 0.0,
+        },
+    };
+    let metrics = metrics_json.and_then(|json| serde_json::from_str(&json).ok());
+    (Some(annotation), metrics)
 }

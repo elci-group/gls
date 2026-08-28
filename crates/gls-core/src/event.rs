@@ -123,6 +123,8 @@ pub struct ToolProgress {
 pub enum PipelineEvent {
     /// A filesystem object was discovered.
     Discovery(FsEntry),
+    /// Padagonia's deterministic metadata cache decision for this path.
+    CacheStatus { path: PathBuf, hit: bool },
     /// The preferred display order after metadata-based sorting is available.
     OrderUpdated { paths: Vec<PathBuf> },
     /// A semantic type was assigned.
@@ -175,6 +177,7 @@ impl PipelineEvent {
     pub fn path(&self) -> Option<&PathBuf> {
         match self {
             PipelineEvent::Discovery(e) => Some(&e.path),
+            PipelineEvent::CacheStatus { path, .. } => Some(path),
             PipelineEvent::OrderUpdated { .. } => None,
             PipelineEvent::TypeDetected { path, .. } => Some(path),
             PipelineEvent::Measured(m) => Some(&m.path),
