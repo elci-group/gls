@@ -61,7 +61,14 @@ fn render_tool(name: &str, p: &ToolProgress, color: bool) -> String {
     let msg = p
         .message
         .as_ref()
-        .map(|m| format!(" {m}"))
+        .map(|m| {
+            let truncated = if m.chars().count() > 20 {
+                format!("{}…", m.chars().take(19).collect::<String>())
+            } else {
+                m.clone()
+            };
+            format!(" {truncated}")
+        })
         .unwrap_or_default();
     let body = format!("{icon} {name}{progress}{msg}");
     if !color {
