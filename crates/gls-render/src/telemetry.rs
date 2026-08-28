@@ -71,7 +71,7 @@ fn state_icon(state: ToolState) -> &'static str {
 }
 
 fn state_colour(state: ToolState) -> String {
-    use crate::format::{code_green, code_red, code_reset, code_yellow};
+    use crate::format::{code_green, code_red, code_yellow};
     match state {
         ToolState::Idle => String::new(),
         ToolState::Running => code_yellow(),
