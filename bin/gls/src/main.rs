@@ -248,7 +248,9 @@ async fn main() {
     // ── Spawn renderer and Padagonia consumer ──────────────────────────────────
     let renderer = Renderer::new(render_config);
     let render_task = tokio::spawn(async move { renderer.run(rx_render).await });
-    let padagonia_task = tokio::spawn(async move { padagonia.consume_stream(rx_padagonia).await });
+    let tx_padagonia = tx.clone();
+    let padagonia_task =
+        tokio::spawn(async move { padagonia.consume_stream(rx_padagonia, tx_padagonia).await });
 
     // ── DISCOVER ───────────────────────────────────────────────────────────────
     // Collect entries on a private channel first (we need the Vec for later

@@ -1,6 +1,8 @@
 //! Shared pipeline infrastructure: metric types, presentation state machine,
 //! and the broadcast channel type alias.
 
+use crate::event::{PipelineEvent, ToolProgress};
+pub use crate::event::ToolState;
 use crate::semantic::Provenance;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -47,6 +49,24 @@ impl PipelineSender {
             live
         });
         delivered
+    }
+
+    /// Emit a telemetry update for the HUD.
+    pub fn tool_progress(
+        &self,
+        tool: &str,
+        state: ToolState,
+        current: u64,
+        total: u64,
+        message: Option<&str>,
+    ) {
+        let _ = self.send(PipelineEvent::ToolProgress(ToolProgress {
+            tool: tool.to_string(),
+            state,
+            current,
+            total,
+            message: message.map(|s| s.to_string()),
+        }));
     }
 }
 

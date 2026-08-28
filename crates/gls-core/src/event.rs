@@ -163,6 +163,9 @@ pub enum PipelineEvent {
     /// A context provider is unavailable for this run.
     /// Emitted at most once per run; disables contextualisation globally.
     ProviderUnavailable { provider: String, reason: String },
+    /// Telemetry update for the HUD: progress / state / traced error of an
+    /// underlying tool.
+    ToolProgress(ToolProgress),
     /// The pipeline has finished all phases for all objects.
     PipelineComplete,
 }
@@ -183,6 +186,7 @@ impl PipelineEvent {
             PipelineEvent::Persisted { path, .. } => Some(path),
             PipelineEvent::Warning { path, .. } => path.as_ref(),
             PipelineEvent::ProviderUnavailable { .. } => None,
+            PipelineEvent::ToolProgress(_) => None,
             PipelineEvent::PipelineComplete => None,
         }
     }

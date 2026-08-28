@@ -397,13 +397,19 @@ impl Padagonia {
     /// `MetricsUpdated` have been received, or when `PipelineComplete` fires —
     /// whichever comes first.  This prevents a race where metrics arrive after
     /// an annotation is already persisted without them.
-    pub async fn consume_stream(self, mut rx: PipelineReceiver) {
+    pub async fn consume_stream(
+        self,
+        mut rx: PipelineReceiver,
+        tx: gls_core::pipeline::PipelineSender,
+    ) {
         use std::collections::HashMap;
         let mut annotations: HashMap<PathBuf, ContextAnnotation> = HashMap::new();
         let mut descriptors: HashMap<PathBuf, Descriptor> = HashMap::new();
         let mut metrics: HashMap<PathBuf, MetricBundle> = HashMap::new();
         // Tracks which paths have already been persisted this run.
         let mut persisted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+        tx.tool_progress("padagonia", gls_core::pipeline::ToolState::Running, 0, 0, None);
 
         loop {
             match rx.recv().await {
@@ -454,8 +460,16 @@ impl Padagonia {
                                 }
                             }
                         }
+                        tx.tool_progress(
+                            "padagonia",
+                            gls_core::pipeline::ToolState::Completed,
+                            persisted.len() as u64,
+                            0,
+                            None,
+                        );
                         break;
                     }
+                    PipelineEvent::ToolProgress(_) => {}
                     _ => {}
                 },
                 None => {
@@ -469,6 +483,13 @@ impl Padagonia {
                             }
                         }
                     }
+                    tx.tool_progress(
+                        "padagonia",
+                        gls_core::pipeline::ToolState::Completed,
+                        persisted.len() as u64,
+                        0,
+                        None,
+                    );
                     break;
                 }
             }

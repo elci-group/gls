@@ -100,11 +100,25 @@ impl Contextualiser {
     /// objects.  Individual per-object failures emit `Warning` events.
     pub async fn contextualise(&self, descriptors: Vec<Descriptor>, tx: PipelineSender) {
         // ── Pre-flight ────────────────────────────────────────────────────────
+        tx.tool_progress(
+            "context",
+            gls_core::pipeline::ToolState::Running,
+            0,
+            descriptors.len() as u64,
+            Some("preflight"),
+        );
         if let Err(reason) = self.preflight().await {
             let _ = tx.send(PipelineEvent::ProviderUnavailable {
                 provider: PROVIDER.to_string(),
-                reason,
+                reason: reason.clone(),
             });
+            tx.tool_progress(
+                "context",
+                gls_core::pipeline::ToolState::Failed,
+                0,
+                descriptors.len() as u64,
+                Some(&reason),
+            );
             return;
         }
 
@@ -113,6 +127,13 @@ impl Contextualiser {
         // position / ETA immediately, rather than a generic "pending" state
         // for however long it takes this sequential loop to reach them.
         let total = descriptors.len() as u32;
+        tx.tool_progress(
+            "context",
+            gls_core::pipeline::ToolState::Running,
+            0,
+            total as u64,
+            None,
+        );
         for (i, desc) in descriptors.iter().enumerate() {
             let _ = tx.send(PipelineEvent::ContextQueued {
                 path: desc.path.clone(),
@@ -123,23 +144,45 @@ impl Contextualiser {
         }
 
         // ── Per-object contextualisation ──────────────────────────────────────
-        for desc in descriptors {
+        for (i, desc) in descriptors.iter().enumerate() {
             let path = desc.path.clone();
             let _ = tx.send(PipelineEvent::ContextStarted { path: path.clone() });
 
-            match self.contextualise_one(&desc).await {
+            match self.contextualise_one(desc).await {
                 Ok((annotation, metrics)) => {
                     let _ = tx.send(PipelineEvent::ContextUpdated(annotation));
                     let _ = tx.send(PipelineEvent::MetricsUpdated(metrics));
+                    tx.tool_progress(
+                        "context",
+                        gls_core::pipeline::ToolState::Running,
+                        (i + 1) as u64,
+                        total as u64,
+                        None,
+                    );
                 }
                 Err(e) => {
                     let _ = tx.send(PipelineEvent::Warning {
                         path: Some(path),
                         message: format!("context error: {e}"),
                     });
+                    tx.tool_progress(
+                        "context",
+                        gls_core::pipeline::ToolState::Running,
+                        (i + 1) as u64,
+                        total as u64,
+                        Some(&e),
+                    );
                 }
             }
         }
+
+        tx.tool_progress(
+            "context",
+            gls_core::pipeline::ToolState::Completed,
+            total as u64,
+            total as u64,
+            None,
+        );
     }
 
     /// Resolve the actual model to use.

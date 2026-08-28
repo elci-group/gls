@@ -40,6 +40,7 @@ use crate::{
     },
     queue::QueueTracker,
     state::EntryDisplayState,
+    telemetry::Telemetry,
 };
 use crossterm::{cursor, style, terminal, QueueableCommand};
 use gls_core::{
@@ -163,14 +164,26 @@ async fn plain_run(mut rx: PipelineReceiver, grid: bool) {
     let mut order: Vec<PathBuf> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut queue = QueueTracker::default();
+    let mut telemetry = Telemetry::default();
 
     while let Some(event) = rx.recv().await {
         let done = matches!(event, PipelineEvent::PipelineComplete);
-        apply_event(&mut entries, &mut order, &mut warnings, &mut queue, event);
+        apply_event(
+            &mut entries,
+            &mut order,
+            &mut warnings,
+            &mut queue,
+            &mut telemetry,
+            event,
+        );
         if done {
             break;
         }
     }
+
+    // Print the final telemetry HUD before the listing.
+    let hud = telemetry.render(false);
+    let _ = writeln!(io::stdout(), "{hud}");
 
     if grid {
         // By the time this prints, the pipeline has already completed, so
@@ -230,6 +243,7 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
     // Warnings deferred until after the grid exits.
     let mut warnings: Vec<String> = Vec::new();
     let mut queue = QueueTracker::default();
+    let mut telemetry = Telemetry::default();
 
     // Only used in `!grid` mode (line-diffed retained rendering).
     let mut prev_rows: Vec<RenderedRow> = Vec::new();
@@ -266,7 +280,14 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                 match result {
                     Some(ev) => {
                         let done = matches!(ev, PipelineEvent::PipelineComplete);
-                        apply_event(&mut entries, &mut order, &mut warnings, &mut queue, ev);
+                        apply_event(
+                            &mut entries,
+                            &mut order,
+                            &mut warnings,
+                            &mut queue,
+                            &mut telemetry,
+                            ev,
+                        );
                         if done { pipeline_done = true; }
                     }
                     None => { pipeline_done = true; }
@@ -285,7 +306,14 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
             match rx.try_recv() {
                 Ok(ev) => {
                     let done = matches!(ev, PipelineEvent::PipelineComplete);
-                    apply_event(&mut entries, &mut order, &mut warnings, &mut queue, ev);
+                    apply_event(
+                        &mut entries,
+                        &mut order,
+                        &mut warnings,
+                        &mut queue,
+                        &mut telemetry,
+                        ev,
+                    );
                     if done {
                         pipeline_done = true;
                     }
@@ -320,13 +348,15 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
 
         // ── Render once ───────────────────────────────────────────────────────
         if !order.is_empty() {
+            let hud = telemetry.render(true);
             if grid {
-                render_grid_frame(&entries, &order, &queue, &mut prev_line_count);
+                render_grid_frame(&entries, &order, &queue, &hud, &mut prev_line_count);
             } else {
                 retained_render(
                     &entries,
                     &order,
                     &queue,
+                    &hud,
                     &mut prev_rows,
                     &mut prev_line_count,
                 );
@@ -369,6 +399,7 @@ fn render_grid_frame(
     entries: &HashMap<PathBuf, EntryDisplayState>,
     order: &[PathBuf],
     queue: &QueueTracker,
+    hud: &str,
     prev_line_count: &mut u16,
 ) {
     let mut stdout = io::stdout();
@@ -377,9 +408,10 @@ fn render_grid_frame(
         let _ = stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown));
     }
     let rendered = crate::grid::render_grid(entries, order, queue, terminal_width(), true);
-    let _ = stdout.queue(style::Print(&rendered));
+    let _ = stdout.queue(style::Print(format!("{hud}\n{rendered}")));
     let _ = stdout.flush();
-    *prev_line_count = rendered.matches('\n').count() as u16;
+    // HUD line + grid lines.
+    *prev_line_count = 1 + rendered.matches('\n').count() as u16;
 }
 
 // ── Retained-mode redraw ──────────────────────────────────────────────────────
@@ -388,6 +420,7 @@ fn retained_render(
     entries: &HashMap<PathBuf, EntryDisplayState>,
     order: &[PathBuf],
     queue: &QueueTracker,
+    hud: &str,
     prev_rows: &mut Vec<RenderedRow>,
     prev_line_count: &mut u16,
 ) {
@@ -401,6 +434,9 @@ fn retained_render(
 
     // ── First paint: print everything downward from current cursor ────────────
     if prev_rows.is_empty() {
+        let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
+        let _ = stdout.queue(style::Print(hud));
+        let _ = stdout.queue(cursor::MoveToNextLine(1));
         for row in &new_rows {
             let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
             let _ = stdout.queue(style::Print(&row.primary));
@@ -412,13 +448,18 @@ fn retained_render(
             }
         }
         let _ = stdout.flush();
-        *prev_line_count = new_rows.iter().map(|r| r.line_count()).sum();
+        *prev_line_count = 1 + new_rows.iter().map(|r| r.line_count()).sum::<u16>();
         *prev_rows = new_rows;
         return;
     }
 
     // ── Subsequent paints: move to top of grid, selectively overdraw ──────────
     let _ = stdout.queue(cursor::MoveToPreviousLine(*prev_line_count));
+
+    // Redraw HUD line.
+    let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
+    let _ = stdout.queue(style::Print(hud));
+    let _ = stdout.queue(cursor::MoveToNextLine(1));
 
     let mut new_total: u16 = 0;
     let mut prev_iter = prev_rows.iter();
@@ -454,8 +495,8 @@ fn retained_render(
     }
 
     // Erase any leftover lines if grid shrank.
-    if new_total < *prev_line_count {
-        let leftover = *prev_line_count - new_total;
+    if new_total < *prev_line_count - 1 {
+        let leftover = *prev_line_count - 1 - new_total;
         for _ in 0..leftover {
             let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
             let _ = stdout.queue(cursor::MoveToNextLine(1));
@@ -464,7 +505,7 @@ fn retained_render(
     }
 
     let _ = stdout.flush();
-    *prev_line_count = new_total;
+    *prev_line_count = 1 + new_total;
     *prev_rows = new_rows;
 }
 
@@ -703,6 +744,7 @@ fn apply_event(
     order: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
     queue: &mut QueueTracker,
+    telemetry: &mut Telemetry,
     event: PipelineEvent,
 ) {
     match event {
@@ -822,6 +864,10 @@ fn apply_event(
             warnings.push(format!(
                 "[warn] context provider '{provider}' unavailable: {reason}"
             ));
+        }
+
+        PipelineEvent::ToolProgress(p) => {
+            telemetry.update(p);
         }
 
         PipelineEvent::PipelineComplete => { /* handled by caller */ }

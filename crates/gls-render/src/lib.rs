@@ -8,6 +8,7 @@ mod grid;
 mod queue;
 mod renderer;
 mod state;
+mod telemetry;
 
 pub use format::human_bytes;
 pub use renderer::{OutputMode, RenderConfig, Renderer};

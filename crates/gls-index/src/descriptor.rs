@@ -21,6 +21,9 @@ pub async fn build_descriptor(
     excerpt_bytes: usize,
     tx: PipelineSender,
 ) -> Vec<Descriptor> {
+    let total = items.len() as u64;
+    tx.tool_progress("index", gls_core::pipeline::ToolState::Running, 0, total, None);
+
     let results = tokio::task::spawn_blocking(move || {
         items
             .into_iter()
@@ -30,9 +33,24 @@ pub async fn build_descriptor(
     .await
     .unwrap_or_default();
 
-    for desc in &results {
+    for (i, desc) in results.iter().enumerate() {
         let _ = tx.send(PipelineEvent::Indexed(desc.clone()));
+        tx.tool_progress(
+            "index",
+            gls_core::pipeline::ToolState::Running,
+            (i + 1) as u64,
+            total,
+            None,
+        );
     }
+
+    tx.tool_progress(
+        "index",
+        gls_core::pipeline::ToolState::Completed,
+        total,
+        total,
+        None,
+    );
     results
 }
 

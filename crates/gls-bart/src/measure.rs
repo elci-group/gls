@@ -28,6 +28,9 @@ pub async fn measure_entry(
     requests: Vec<(PathBuf, usize)>,
     tx: PipelineSender,
 ) -> Vec<Measurement> {
+    let total = requests.len() as u64;
+    tx.tool_progress("bart", gls_core::pipeline::ToolState::Running, 0, total, None);
+
     let results = tokio::task::spawn_blocking(move || {
         requests
             .iter()
@@ -37,9 +40,24 @@ pub async fn measure_entry(
     .await
     .unwrap_or_default();
 
-    for m in &results {
+    for (i, m) in results.iter().enumerate() {
         let _ = tx.send(PipelineEvent::Measured(m.measure.clone()));
+        tx.tool_progress(
+            "bart",
+            gls_core::pipeline::ToolState::Running,
+            (i + 1) as u64,
+            total,
+            None,
+        );
     }
+
+    tx.tool_progress(
+        "bart",
+        gls_core::pipeline::ToolState::Completed,
+        total,
+        total,
+        None,
+    );
     results
 }
 

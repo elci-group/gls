@@ -46,6 +46,8 @@ pub async fn discover(root: PathBuf, config: DiscoverConfig, tx: PipelineSender)
 fn collect_entries(root: &Path, config: &DiscoverConfig, tx: &PipelineSender) -> Vec<FsEntry> {
     let mut out = Vec::new();
 
+    tx.tool_progress("discover", gls_core::pipeline::ToolState::Running, 0, 0, None);
+
     let walker = WalkDir::new(root)
         .max_depth(config.max_depth)
         .follow_links(config.follow_links)
@@ -60,7 +62,16 @@ fn collect_entries(root: &Path, config: &DiscoverConfig, tx: &PipelineSender) ->
     for result in walker {
         let dent = match result {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(e) => {
+                tx.tool_progress(
+                    "discover",
+                    gls_core::pipeline::ToolState::Failed,
+                    out.len() as u64,
+                    0,
+                    Some(&e.to_string()),
+                );
+                continue;
+            }
         };
 
         // Skip the root itself.
@@ -136,8 +147,22 @@ fn collect_entries(root: &Path, config: &DiscoverConfig, tx: &PipelineSender) ->
         };
         let _ = tx.send(PipelineEvent::Discovery(entry.clone()));
         out.push(entry);
+        tx.tool_progress(
+            "discover",
+            gls_core::pipeline::ToolState::Running,
+            out.len() as u64,
+            0,
+            None,
+        );
     }
 
+    tx.tool_progress(
+        "discover",
+        gls_core::pipeline::ToolState::Completed,
+        out.len() as u64,
+        out.len() as u64,
+        None,
+    );
     out
 }
 

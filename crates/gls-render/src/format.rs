@@ -9,25 +9,28 @@ use gls_core::semantic::Classification;
 
 use form3::ansi::{fg, reset, sgr, AnsiColor, Attr, Color};
 
-fn code_reset() -> &'static str {
+pub(crate) fn code_reset() -> &'static str {
     reset()
 }
-fn code_dim() -> String {
+pub(crate) fn code_dim() -> String {
     sgr(Attr::Dim)
 }
-fn code_bold() -> String {
+pub(crate) fn code_bold() -> String {
     sgr(Attr::Bold)
 }
-fn code_cyan() -> String {
+pub(crate) fn code_cyan() -> String {
     fg(&AnsiColor::Standard(Color::Cyan, false))
 }
-fn code_yellow() -> String {
+pub(crate) fn code_yellow() -> String {
     fg(&AnsiColor::Standard(Color::Yellow, false))
 }
-fn code_green() -> String {
+pub(crate) fn code_green() -> String {
     fg(&AnsiColor::Standard(Color::Green, false))
 }
-fn code_magenta() -> String {
+pub(crate) fn code_red() -> String {
+    fg(&AnsiColor::Standard(Color::Red, false))
+}
+pub(crate) fn code_magenta() -> String {
     fg(&AnsiColor::Standard(Color::Magenta, false))
 }
 

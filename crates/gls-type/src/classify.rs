@@ -16,6 +16,9 @@ pub async fn classify_entry(
     entries: Vec<FsEntry>,
     tx: PipelineSender,
 ) -> Vec<(std::path::PathBuf, Classification)> {
+    let total = entries.len() as u64;
+    tx.tool_progress("type", gls_core::pipeline::ToolState::Running, 0, total, None);
+
     let results = tokio::task::spawn_blocking(move || {
         entries
             .into_iter()
@@ -28,12 +31,27 @@ pub async fn classify_entry(
     .await
     .unwrap_or_default();
 
-    for (path, classification) in &results {
+    for (i, (path, classification)) in results.iter().enumerate() {
         let _ = tx.send(PipelineEvent::TypeDetected {
             path: path.clone(),
             classification: classification.clone(),
         });
+        tx.tool_progress(
+            "type",
+            gls_core::pipeline::ToolState::Running,
+            (i + 1) as u64,
+            total,
+            None,
+        );
     }
+
+    tx.tool_progress(
+        "type",
+        gls_core::pipeline::ToolState::Completed,
+        total,
+        total,
+        None,
+    );
     results
 }
 
