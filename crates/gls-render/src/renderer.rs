@@ -45,7 +45,7 @@ use crate::{
 use crossterm::{cursor, style, terminal, QueueableCommand};
 use gls_core::{
     entry::EntryKind,
-    event::PipelineEvent,
+    event::{PipelineEvent, ToolProgress, ToolState},
     pipeline::{PipelineReceiver, PresentationState},
 };
 use std::collections::HashMap;
