@@ -17,16 +17,23 @@ impl Telemetry {
 
     /// Render a compact HUD line.
     pub fn render(&self, color: bool) -> String {
-        let order = ["discover", "type", "bart", "index", "context", "padagonia"];
+        let order = [
+            ("discover", "disc"),
+            ("type", "type"),
+            ("bart", "bart"),
+            ("index", "idx"),
+            ("context", "ctx"),
+            ("padagonia", "pad"),
+        ];
         let mut parts = Vec::new();
-        for name in order {
-            if let Some(p) = self.tools.get(name) {
-                parts.push(render_tool(name, p, color));
+        for (full, short) in order {
+            if let Some(p) = self.tools.get(full) {
+                parts.push(render_tool(short, p, color));
             } else {
                 parts.push(render_tool(
-                    name,
+                    short,
                     &ToolProgress {
-                        tool: name.to_string(),
+                        tool: full.to_string(),
                         state: ToolState::Idle,
                         current: 0,
                         total: 0,
@@ -36,7 +43,7 @@ impl Telemetry {
                 ));
             }
         }
-        parts.join("  ")
+        parts.join(" ")
     }
 
 }
