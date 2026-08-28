@@ -867,6 +867,16 @@ fn apply_event(
             } else {
                 warnings.push(format!("[warn] {message}"));
             }
+
+            // Surface the latest warning in the HUD so failures are visible
+            // without scrolling back through stderr.
+            telemetry.update(ToolProgress {
+                tool: "warn".to_string(),
+                state: ToolState::Failed,
+                current: 0,
+                total: 0,
+                message: Some(message),
+            });
         }
 
         PipelineEvent::ProviderUnavailable { provider, reason } => {
@@ -880,6 +890,14 @@ fn apply_event(
             warnings.push(format!(
                 "[warn] context provider '{provider}' unavailable: {reason}"
             ));
+
+            telemetry.update(ToolProgress {
+                tool: "ctx".to_string(),
+                state: ToolState::Failed,
+                current: 0,
+                total: 0,
+                message: Some(format!("{provider}: {reason}")),
+            });
         }
 
         PipelineEvent::ToolProgress(p) => {
