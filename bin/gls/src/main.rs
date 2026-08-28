@@ -27,6 +27,8 @@ use gls_padagonia::{Padagonia, PadagoniaConfig};
 use gls_render::{OutputMode, RenderConfig, Renderer};
 use gls_type::classify_entry;
 
+const ANALYSIS_CACHE_VERSION: &str = "gls-analysis-v1";
+
 mod menu;
 mod provider_cmd;
 
@@ -240,8 +242,8 @@ async fn main() {
         })
         .expect("in-memory SQLite must always work")
     });
-    // Keep clones for incremental cache-hit filtering in the CONTEXT phase
-    // and for persisting BART's recursive size breakdown.
+    // Keep clones for deterministic snapshot queries, context filtering, and
+    // persisting BART's recursive size breakdown.
     let padagonia_query = padagonia.clone();
     let padagonia_sizes = padagonia.clone();
 
@@ -272,10 +274,71 @@ async fn main() {
         paths: entries.iter().map(|entry| entry.path.clone()).collect(),
     });
 
-    // ── TYPE ∥ BART ────────────────────────────────────────────────────────────
-    // Run classification and physical measurement concurrently, collecting both
-    // result maps so they can be forwarded into the INDEX phase descriptors.
-    let measurement_requests: Vec<(PathBuf, usize)> = entries
+    // ── CACHE PARTITION ────────────────────────────────────────────────────────
+    // Stat-keyed hits are replayed through the ordinary event stream. Only
+    // misses continue into TYPE/BART/INDEX, avoiding redundant file reads,
+    // recursive directory walks, and descriptor construction.
+    let mut cached = std::collections::HashMap::new();
+    let mut misses = Vec::new();
+    for entry in &entries {
+        match padagonia_query.lookup_snapshot(entry, ANALYSIS_CACHE_VERSION, &target) {
+            Some(snapshot) => {
+                cached.insert(entry.path.clone(), snapshot);
+            }
+            None => misses.push(entry.path.clone()),
+        }
+    }
+
+    // A visible changed descendant invalidates cached directory ancestors: a
+    // directory's BART aggregate includes that descendant even when its own
+    // inode metadata did not change.
+    let ancestor_misses: Vec<_> = cached
+        .iter()
+        .filter(|(path, snapshot)| {
+            snapshot.entry.kind == gls_core::entry::EntryKind::Directory
+                && misses.iter().any(|changed| changed != *path && changed.starts_with(path))
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in ancestor_misses {
+        cached.remove(&path);
+        misses.push(path);
+    }
+
+    let mut classifications = std::collections::HashMap::new();
+    let mut measurements = std::collections::HashMap::new();
+    let mut descriptor_map = std::collections::HashMap::new();
+    for entry in &entries {
+        if let Some(snapshot) = cached.get(&entry.path) {
+            let _ = tx.send(PipelineEvent::CacheStatus { path: entry.path.clone(), hit: true });
+            let _ = tx.send(PipelineEvent::TypeDetected {
+                path: entry.path.clone(),
+                classification: snapshot.classification.clone(),
+            });
+            let _ = tx.send(PipelineEvent::Measured(snapshot.measurement.clone()));
+            let _ = tx.send(PipelineEvent::Indexed(snapshot.descriptor.clone()));
+            if let Some(context) = &snapshot.context {
+                let _ = tx.send(PipelineEvent::ContextUpdated(context.clone()));
+            }
+            if let Some(metrics) = &snapshot.metrics {
+                let _ = tx.send(PipelineEvent::MetricsUpdated(metrics.clone()));
+            }
+            classifications.insert(entry.path.clone(), snapshot.classification.clone());
+            measurements.insert(entry.path.clone(), snapshot.measurement.clone());
+            descriptor_map.insert(entry.path.clone(), snapshot.descriptor.clone());
+        } else {
+            let _ = tx.send(PipelineEvent::CacheStatus { path: entry.path.clone(), hit: false });
+        }
+    }
+
+    let changed_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| !cached.contains_key(&entry.path))
+        .cloned()
+        .collect();
+
+    // ── TYPE ∥ BART (MISSES ONLY) ─────────────────────────────────────────────
+    let measurement_requests: Vec<(PathBuf, usize)> = changed_entries
         .iter()
         .map(|entry| {
             // BART is a fast, deterministic local walk; for every directory
@@ -288,19 +351,19 @@ async fn main() {
 
     let tx_type = tx.clone();
     let tx_bart = tx.clone();
-    let entries_clone = entries.clone();
+    let entries_clone = changed_entries.clone();
 
     let (classification_results, measurement_results) = tokio::join!(
         classify_entry(entries_clone, tx_type),
         measure_entry(measurement_requests, tx_bart),
     );
 
-    let classifications: std::collections::HashMap<_, _> =
-        classification_results.into_iter().collect();
-    let measurements: std::collections::HashMap<_, _> = measurement_results
-        .iter()
-        .map(|result| (result.measure.path.clone(), result.measure.clone()))
-        .collect();
+    classifications.extend(classification_results);
+    measurements.extend(
+        measurement_results
+            .iter()
+            .map(|result| (result.measure.path.clone(), result.measure.clone())),
+    );
     let aggregates: Vec<_> = measurement_results
         .into_iter()
         .flat_map(|result| result.aggregates)
@@ -311,7 +374,7 @@ async fn main() {
 
     // ── INDEX ──────────────────────────────────────────────────────────────────
     // Build descriptors with type + physical data attached; forward events.
-    let descriptor_items = entries
+    let descriptor_items = changed_entries
         .iter()
         .map(|entry| {
             (
@@ -321,7 +384,52 @@ async fn main() {
             )
         })
         .collect();
-    let descriptors = build_descriptor(descriptor_items, bound.excerpt_bytes, tx.clone()).await;
+    let rebuilt_descriptors = build_descriptor(descriptor_items, bound.excerpt_bytes, tx.clone()).await;
+    descriptor_map.extend(
+        rebuilt_descriptors
+            .into_iter()
+            .map(|descriptor| (descriptor.path.clone(), descriptor)),
+    );
+
+    // Persist fresh deterministic snapshots before optional inference. Their
+    // descriptors later join context revisions by descriptor hash.
+    for entry in &changed_entries {
+        let Some(classification) = classifications.get(&entry.path) else { continue };
+        let Some(measurement) = measurements.get(&entry.path) else { continue };
+        let Some(descriptor) = descriptor_map.get(&entry.path) else { continue };
+        if let Err(error) = padagonia_query.store_snapshot(
+            entry,
+            classification,
+            measurement,
+            descriptor,
+            ANALYSIS_CACHE_VERSION,
+        ) {
+            eprintln!("[warn] could not persist metadata snapshot: {error}");
+        }
+    }
+
+    let descriptors: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| descriptor_map.get(&entry.path).cloned())
+        .collect();
+
+    // A metadata-only change may rebuild to the same descriptor. Hydrate its
+    // existing contextual insight now, without remote inference or a duplicate
+    // history revision.
+    for descriptor in &descriptors {
+        if cached.contains_key(&descriptor.path) {
+            continue;
+        }
+        if let Some((context, metrics)) =
+            padagonia_query.cached_context(&descriptor.path, &descriptor.descriptor_hash)
+        {
+            let _ = tx.send(PipelineEvent::CacheHydrated { path: descriptor.path.clone() });
+            let _ = tx.send(PipelineEvent::ContextUpdated(context));
+            if let Some(metrics) = metrics {
+                let _ = tx.send(PipelineEvent::MetricsUpdated(metrics));
+            }
+        }
+    }
 
     // ── CONTEXT ────────────────────────────────────────────────────────────────
     if !bound.no_context {

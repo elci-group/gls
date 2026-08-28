@@ -635,6 +635,9 @@ impl Padagonia {
                         // the path persisted prevents duplicate revisions.
                         persisted.insert(path);
                     }
+                    PipelineEvent::CacheHydrated { path } => {
+                        persisted.insert(path);
+                    }
                     PipelineEvent::Indexed(d) => {
                         descriptors.insert(d.path.clone(), d);
                     }

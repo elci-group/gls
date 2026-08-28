@@ -125,6 +125,9 @@ pub enum PipelineEvent {
     Discovery(FsEntry),
     /// Padagonia's deterministic metadata cache decision for this path.
     CacheStatus { path: PathBuf, hit: bool },
+    /// Marks following context/metric events as replayed rather than newly
+    /// inferred, so persistence consumers do not create duplicate revisions.
+    CacheHydrated { path: PathBuf },
     /// The preferred display order after metadata-based sorting is available.
     OrderUpdated { paths: Vec<PathBuf> },
     /// A semantic type was assigned.
@@ -178,6 +181,7 @@ impl PipelineEvent {
         match self {
             PipelineEvent::Discovery(e) => Some(&e.path),
             PipelineEvent::CacheStatus { path, .. } => Some(path),
+            PipelineEvent::CacheHydrated { path } => Some(path),
             PipelineEvent::OrderUpdated { .. } => None,
             PipelineEvent::TypeDetected { path, .. } => Some(path),
             PipelineEvent::Measured(m) => Some(&m.path),

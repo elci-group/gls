@@ -777,6 +777,7 @@ fn apply_event(
             }
         }
         PipelineEvent::CacheStatus { .. } => { /* telemetry-only */ }
+        PipelineEvent::CacheHydrated { .. } => { /* persistence marker */ }
 
         PipelineEvent::OrderUpdated { paths } => {
             let mut seen = std::collections::HashSet::new();
