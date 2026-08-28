@@ -117,15 +117,24 @@ fn build_one(
     }
 }
 
-/// SHA-256 of the first 4 KiB of the file (cheap, representative).
+/// SHA-256 of the complete file. This only runs for identity-cache misses, so
+/// unchanged files avoid reads entirely while same-prefix edits are still
+/// detected exactly.
 fn hash_path(path: &Path) -> Option<String> {
     if path.is_dir() {
         return None;
     }
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 4096];
-    let n = f.read(&mut buf).ok()?;
-    Some(hex::encode(Sha256::digest(&buf[..n])))
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// First ~20 non-empty lines from a strictly bounded byte prefix.
@@ -176,6 +185,17 @@ mod tests {
         };
         let descriptor = build_one(file.path(), Some(&classification), None, 8_192);
         assert!(descriptor.payload["excerpt"].is_null());
+    }
+
+    #[test]
+    fn source_hash_covers_bytes_beyond_the_excerpt_prefix() {
+        let mut contents = vec![b'x'; 8 * 1024];
+        let file = ScratchFile::new(&contents);
+        let before = hash_path(file.path()).unwrap();
+        contents.push(b'y');
+        std::fs::write(file.path(), &contents).unwrap();
+        let after = hash_path(file.path()).unwrap();
+        assert_ne!(before, after);
     }
 
     struct ScratchFile(PathBuf);
