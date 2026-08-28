@@ -177,6 +177,22 @@ async fn plain_run(mut rx: PipelineReceiver, grid: bool) {
             event,
         );
         if done {
+            // Drain any trailing telemetry events (e.g. padagonia completed)
+            // that were emitted after the completion marker.
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => apply_event(
+                        &mut entries,
+                        &mut order,
+                        &mut warnings,
+                        &mut queue,
+                        &mut telemetry,
+                        ev,
+                    ),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
             break;
         }
     }
