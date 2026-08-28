@@ -131,7 +131,23 @@ overwritten — enabling historical queries:
 - *When did its quality decline?*
 - *What contextualisation changed after this commit?*
 
-Padagonia is stored at `~/.local/share/gls/padagonia.db`.
+Padagonia is stored at `~/.local/share/gls/padagonia.db` (override with
+`GLS_PADAGONIA_DB` for an isolated store).
+
+Alongside contextual revisions, Padagonia keeps a versioned snapshot for each
+path. A snapshot joins the observed path, format, permissions, inode and
+timestamps with deterministic type data, BART size/entropy/line metrics,
+content descriptors and hashes, source tools, and the latest matching inferred
+context and metrics. It also tracks first/last observation, last access, cache
+hits, metadata changes, and content changes.
+
+On each scan GLS compares a cheap identity fingerprint first. Unchanged entries
+replay the complete snapshot through the normal event stream; TYPE, BART and
+INDEX receive an empty workload. Changed entries alone are re-analysed and get
+a full-file content hash. A matching historical descriptor can still reuse its
+natural-language context, while a changed descriptor becomes eligible for new
+opt-in inference. Directory fingerprints incorporate immediate-child metadata,
+and visible changed descendants invalidate cached ancestor aggregates.
 
 ---
 
