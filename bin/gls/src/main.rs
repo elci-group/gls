@@ -27,7 +27,7 @@ use gls_padagonia::{Padagonia, PadagoniaConfig};
 use gls_render::{OutputMode, RenderConfig, Renderer};
 use gls_type::classify_entry;
 
-const ANALYSIS_CACHE_VERSION: &str = "gls-analysis-v1";
+const ANALYSIS_CACHE_VERSION: &str = "gls-analysis-v2-full-content-hash";
 
 mod menu;
 mod provider_cmd;

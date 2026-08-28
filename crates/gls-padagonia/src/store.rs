@@ -819,3 +819,152 @@ fn latest_context_locked(
     let metrics = metrics_json.and_then(|json| serde_json::from_str(&json).ok());
     (Some(annotation), metrics)
 }
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use gls_core::{
+        entry::EntryKind,
+        semantic::{Classification, SemanticType},
+    };
+
+    #[test]
+    fn unchanged_identity_replays_snapshot_and_changed_content_misses() {
+        let root = ScratchDir::new();
+        let path = root.path().join("sample.rs");
+        std::fs::write(&path, b"fn main() {}\n").unwrap();
+        let database = root.path().join("padagonia.db");
+        let padagonia = Padagonia::open(&PadagoniaConfig { db_path: database }).unwrap();
+        let entry = entry_for(&path, root.path());
+        let classification = Classification {
+            semantic_type: SemanticType::SourceCode,
+            confidence: 1.0,
+            evidence: vec!["test".to_string()],
+            language: Some("Rust".to_string()),
+        };
+        let measurement = PhysicalMeasure {
+            path: path.clone(),
+            logical_bytes: entry.logical_bytes,
+            allocated_bytes: None,
+            tree_bytes: None,
+            object_count: None,
+            entropy: Some(0.5),
+            line_count: Some(1),
+            reclaimable_fraction: None,
+        };
+        let descriptor = Descriptor {
+            path: path.clone(),
+            descriptor_hash: "descriptor-a".to_string(),
+            source_hash: Some("source-a".to_string()),
+            payload: serde_json::json!({"format": "rs"}),
+        };
+
+        padagonia
+            .store_snapshot(
+                &entry,
+                &classification,
+                &measurement,
+                &descriptor,
+                "test-v1",
+            )
+            .unwrap();
+        let hit = padagonia
+            .lookup_snapshot(&entry_for(&path, root.path()), "test-v1", root.path())
+            .expect("unchanged file should hit");
+        assert_eq!(hit.descriptor.descriptor_hash, "descriptor-a");
+        assert_eq!(hit.access_count, 1);
+
+        std::fs::write(&path, b"fn main() { println!(\"changed\"); }\n").unwrap();
+        let changed = entry_for(&path, root.path());
+        assert!(padagonia
+            .lookup_snapshot(&changed, "test-v1", root.path())
+            .is_none());
+
+        let conn = padagonia.conn.lock().unwrap();
+        let observations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_access_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 2);
+    }
+
+    #[test]
+    fn analysis_version_invalidates_without_a_filesystem_change() {
+        let root = ScratchDir::new();
+        let path = root.path().join("sample.txt");
+        std::fs::write(&path, b"same").unwrap();
+        let padagonia = Padagonia::open(&PadagoniaConfig {
+            db_path: root.path().join("padagonia.db"),
+        })
+        .unwrap();
+        let entry = entry_for(&path, root.path());
+        let classification = Classification {
+            semantic_type: SemanticType::Documentation,
+            confidence: 1.0,
+            evidence: vec![],
+            language: None,
+        };
+        let measurement = PhysicalMeasure {
+            path: path.clone(),
+            logical_bytes: 4,
+            allocated_bytes: None,
+            tree_bytes: None,
+            object_count: None,
+            entropy: None,
+            line_count: None,
+            reclaimable_fraction: None,
+        };
+        let descriptor = Descriptor {
+            path,
+            descriptor_hash: "descriptor".into(),
+            source_hash: Some("source".into()),
+            payload: serde_json::Value::Null,
+        };
+        padagonia
+            .store_snapshot(&entry, &classification, &measurement, &descriptor, "v1")
+            .unwrap();
+        assert!(padagonia.lookup_snapshot(&entry, "v2", root.path()).is_none());
+    }
+
+    fn entry_for(path: &Path, root: &Path) -> FsEntry {
+        let metadata = std::fs::metadata(path).unwrap();
+        FsEntry {
+            path: path.to_path_buf(),
+            basename: path.file_name().unwrap().to_string_lossy().to_string(),
+            relative: path.strip_prefix(root).unwrap().to_path_buf(),
+            kind: EntryKind::File,
+            symlink: false,
+            hidden: false,
+            permissions: 0,
+            modified: None,
+            inode: None,
+            logical_bytes: metadata.len(),
+        }
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gls-padagonia-cache-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
