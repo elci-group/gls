@@ -247,6 +247,16 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
     let mut next_tick = tokio::time::Instant::now() + interval;
 
     let mut pipeline_done = false;
+    // Once the pipeline completes, keep the carousel ticking long enough for
+    // the user to see the rotating metadata layers (type, metrics, context).
+    // If context is enabled we also wait for in-flight context calls to
+    // settle, capped so a hanging provider cannot block the UI forever.
+    // Stopping on the context frame avoids shrinking rows back to name-only
+    // and leaving the cursor inside the grid.
+    let mut done_ticks: usize = 0;
+    const DONE_TICK_TARGET: usize = 3;
+    const POST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut pipeline_done_at: Option<tokio::time::Instant> = None;
 
     'outer: loop {
         // ── Wait for the next wakeup (event or tick deadline) ─────────────────
@@ -303,6 +313,9 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                 }
             }
             next_tick = now + interval;
+            if pipeline_done {
+                done_ticks += 1;
+            }
         }
 
         // ── Render once ───────────────────────────────────────────────────────
@@ -320,7 +333,18 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
             }
         }
 
-        if pipeline_done {
+        if pipeline_done && pipeline_done_at.is_none() {
+            pipeline_done_at = Some(now);
+        }
+        let post_completion_timed_out = pipeline_done_at
+            .map(|t| now.duration_since(t) >= POST_COMPLETION_TIMEOUT)
+            .unwrap_or(false);
+        let context_settled = entries.values().all(|s| !s.context_pending);
+
+        if pipeline_done
+            && done_ticks >= DONE_TICK_TARGET
+            && (context_settled || post_completion_timed_out)
+        {
             break 'outer;
         }
     }

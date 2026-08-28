@@ -97,6 +97,26 @@ pub struct MetricBundle {
     pub target_market: Option<crate::pipeline::LabelMetric>,
 }
 
+/// Lifecycle state of an underlying pipeline tool, shown in the HUD.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Progress / status telemetry for one underlying tool, shown in the HUD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProgress {
+    pub tool: String,
+    pub state: ToolState,
+    pub current: u64,
+    pub total: u64,
+    pub message: Option<String>,
+}
+
 /// The single event type flowing through the pipeline broadcast channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

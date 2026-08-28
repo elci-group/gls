@@ -276,8 +276,11 @@ async fn main() {
     let measurement_requests: Vec<(PathBuf, usize)> = entries
         .iter()
         .map(|entry| {
-            let entry_depth = entry.relative.components().count();
-            (entry.path.clone(), bound.depth.saturating_sub(entry_depth))
+            // BART is a fast, deterministic local walk; for every directory
+            // that is actually displayed we want its true recursive tree size,
+            // not a depth-limited approximation that collapses to 0 B for
+            // directories that contain only subdirectories.
+            (entry.path.clone(), usize::MAX)
         })
         .collect();
 
