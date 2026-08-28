@@ -43,6 +43,9 @@ impl Telemetry {
                 ));
             }
         }
+        if let Some(p) = self.tools.get("warn") {
+            parts.push(render_tool("warn", p, color));
+        }
         parts.join(" ")
     }
 
