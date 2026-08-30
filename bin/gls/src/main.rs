@@ -36,7 +36,7 @@ mod provider_cmd;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(
     name  = "gls",
     about = "glass — filesystem meaning, progressively revealed",
@@ -163,6 +163,14 @@ enum SortOrder {
 #[tokio::main]
 async fn __curly_original_main() {
     let cli = Cli::parse();
+    let __curly_target: Vec<String> = curly_expand::expand_or_literal(cli.target.to_string_lossy().as_ref());
+    let __curly_model: Vec<Option<String>> = match &cli.model { Some(v) => curly_expand::expand_or_literal(v).into_iter().map(Some).collect(), None => vec![None] };
+    for __curly_v_target in &__curly_target {
+    for __curly_v_model in &__curly_model {
+        let mut cli = cli.clone();
+        cli.target = std::path::PathBuf::from(__curly_v_target.clone());
+        cli.model = __curly_v_model.clone();
+    {
 
     // ── Subcommands ────────────────────────────────────────────────────────────
     if let Some(cmd) = &cli.command {
@@ -481,6 +489,9 @@ async fn __curly_original_main() {
     // ── Done ───────────────────────────────────────────────────────────────────
     let _ = tx.send(PipelineEvent::PipelineComplete);
     let _ = tokio::join!(render_task, padagonia_task);
+}
+    }
+    }
 }
 
 /// Sort a mutable entry list in-place according to the requested order.
