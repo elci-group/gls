@@ -21,9 +21,10 @@ pub struct Measurement {
     pub aggregates: Vec<SizeAggregate>,
 }
 
-/// Measure a batch of paths, emitting `Measured` events (as before) and
-/// returning the full per-path result, including — for directories — the
-/// complete recursive size breakdown.
+/// Measure a batch of paths, emitting each `Measured` event the moment that
+/// path is measured (not after the whole batch), and returning the full
+/// per-path result, including — for directories — the complete recursive
+/// size breakdown.
 pub async fn measure_entry(
     requests: Vec<(PathBuf, usize)>,
     tx: PipelineSender,
@@ -31,25 +32,27 @@ pub async fn measure_entry(
     let total = requests.len() as u64;
     tx.tool_progress("bart", gls_core::pipeline::ToolState::Running, 0, total, None);
 
+    let worker_tx = tx.clone();
     let results = tokio::task::spawn_blocking(move || {
         requests
             .iter()
-            .map(|(path, max_depth)| measure_path(path, *max_depth))
+            .enumerate()
+            .map(|(i, (path, max_depth))| {
+                let m = measure_path(path, *max_depth);
+                let _ = worker_tx.send(PipelineEvent::Measured(m.measure.clone()));
+                worker_tx.tool_progress(
+                    "bart",
+                    gls_core::pipeline::ToolState::Running,
+                    (i + 1) as u64,
+                    total,
+                    None,
+                );
+                m
+            })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-
-    for (i, m) in results.iter().enumerate() {
-        let _ = tx.send(PipelineEvent::Measured(m.measure.clone()));
-        tx.tool_progress(
-            "bart",
-            gls_core::pipeline::ToolState::Running,
-            (i + 1) as u64,
-            total,
-            None,
-        );
-    }
 
     tx.tool_progress(
         "bart",

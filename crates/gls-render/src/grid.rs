@@ -16,9 +16,9 @@ use crate::format::{bold, dim, human_bytes};
 use crate::queue::QueueTracker;
 use crate::renderer::{entry_icon, live_status_line, GRID_CONTEXT_MAX_CHARS};
 use crate::state::EntryDisplayState;
+use form3::width::display_width;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use unicode_width::UnicodeWidthStr;
 
 const COLUMN_GAP: usize = 2;
 const BLOCK_GAP: usize = 3;
@@ -129,10 +129,8 @@ fn render_grouped(
     }
 
     let mut out = String::new();
-    out.push_str(&dim(&format!(
-        "── grouped by {} ──\n\n",
-        grouping.axis_name
-    )));
+    let heading = format!("── grouped by {} ──\n\n", grouping.axis_name);
+    out.push_str(&if color { dim(&heading) } else { heading });
 
     // Greedily pack blocks left-to-right into rows that fit `width`.
     let mut row: Vec<&Block> = Vec::new();
@@ -184,7 +182,7 @@ fn build_block(
     } else {
         header_plain.clone()
     };
-    let header_w = header_plain.width();
+    let header_w = display_width(&header_plain);
 
     let inner_width = cells
         .iter()
@@ -257,7 +255,7 @@ fn cell(state: &EntryDisplayState, queue: &QueueTracker, color: bool) -> (String
 
     let status_plain = live_status_line(state, queue, GRID_CONTEXT_MAX_CHARS, false);
     let plain = format!("{icon} {} {size} \u{b7} {status_plain}", state.basename);
-    let plain_w = UnicodeWidthStr::width(plain.as_str());
+    let plain_w = display_width(&plain);
 
     let rendered = if color {
         let status = live_status_line(state, queue, GRID_CONTEXT_MAX_CHARS, true);

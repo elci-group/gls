@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Build descriptors for a batch of objects and emit `Indexed` events.
+/// Build descriptors for a batch of objects, emitting each `Indexed` event
+/// the moment that descriptor is built (not after the whole batch).
 pub async fn build_descriptor(
     items: Vec<(PathBuf, Option<Classification>, Option<PhysicalMeasure>)>,
     excerpt_bytes: usize,
@@ -24,25 +25,27 @@ pub async fn build_descriptor(
     let total = items.len() as u64;
     tx.tool_progress("index", gls_core::pipeline::ToolState::Running, 0, total, None);
 
+    let worker_tx = tx.clone();
     let results = tokio::task::spawn_blocking(move || {
         items
             .into_iter()
-            .map(|(path, cls, meas)| build_one(&path, cls.as_ref(), meas.as_ref(), excerpt_bytes))
+            .enumerate()
+            .map(|(i, (path, cls, meas))| {
+                let desc = build_one(&path, cls.as_ref(), meas.as_ref(), excerpt_bytes);
+                let _ = worker_tx.send(PipelineEvent::Indexed(desc.clone()));
+                worker_tx.tool_progress(
+                    "index",
+                    gls_core::pipeline::ToolState::Running,
+                    (i + 1) as u64,
+                    total,
+                    None,
+                );
+                desc
+            })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-
-    for (i, desc) in results.iter().enumerate() {
-        let _ = tx.send(PipelineEvent::Indexed(desc.clone()));
-        tx.tool_progress(
-            "index",
-            gls_core::pipeline::ToolState::Running,
-            (i + 1) as u64,
-            total,
-            None,
-        );
-    }
 
     tx.tool_progress(
         "index",
