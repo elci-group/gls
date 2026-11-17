@@ -11,7 +11,8 @@ use std::path::Path;
 
 // ── Public surface ──────────────────────────────────────────────────────────
 
-/// Classify a batch, emit `TypeDetected` events, and return every result.
+/// Classify a batch, emitting each `TypeDetected` event the moment that
+/// entry is classified (not after the whole batch), and return every result.
 pub async fn classify_entry(
     entries: Vec<FsEntry>,
     tx: PipelineSender,
@@ -19,31 +20,30 @@ pub async fn classify_entry(
     let total = entries.len() as u64;
     tx.tool_progress("type", gls_core::pipeline::ToolState::Running, 0, total, None);
 
+    let worker_tx = tx.clone();
     let results = tokio::task::spawn_blocking(move || {
         entries
             .into_iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(i, e)| {
                 let cls = classify_fs_entry(&e);
+                let _ = worker_tx.send(PipelineEvent::TypeDetected {
+                    path: e.path.clone(),
+                    classification: cls.clone(),
+                });
+                worker_tx.tool_progress(
+                    "type",
+                    gls_core::pipeline::ToolState::Running,
+                    (i + 1) as u64,
+                    total,
+                    None,
+                );
                 (e.path.clone(), cls)
             })
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-
-    for (i, (path, classification)) in results.iter().enumerate() {
-        let _ = tx.send(PipelineEvent::TypeDetected {
-            path: path.clone(),
-            classification: classification.clone(),
-        });
-        tx.tool_progress(
-            "type",
-            gls_core::pipeline::ToolState::Running,
-            (i + 1) as u64,
-            total,
-            None,
-        );
-    }
 
     tx.tool_progress(
         "type",

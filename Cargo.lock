@@ -321,7 +321,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "form3"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "form_urlencoded"
@@ -529,13 +529,11 @@ name = "gls-render"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "crossterm",
  "form3",
  "gls-core",
  "libc",
  "serde_json",
  "tokio",
- "unicode-width",
 ]
 
 [[package]]
@@ -1593,12 +1591,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "untrusted"

@@ -27,9 +27,6 @@ pub(crate) fn code_yellow() -> String {
 pub(crate) fn code_green() -> String {
     fg(&AnsiColor::Standard(Color::Green, false))
 }
-pub(crate) fn code_red() -> String {
-    fg(&AnsiColor::Standard(Color::Red, false))
-}
 pub(crate) fn code_magenta() -> String {
     fg(&AnsiColor::Standard(Color::Magenta, false))
 }

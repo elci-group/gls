@@ -1,36 +1,14 @@
-//! Retained-mode TTY renderer.
+//! Event-driven renderer for plain, JSON, and animated terminal output.
 //!
-//! # Invariant
+//! Terminal frames are repainted using 3form cursor primitives. Warnings are
+//! deferred until the live display has finished.
 //!
-//! **One filesystem object = exactly one stable terminal row.**
-//!
-//! A row's content may change arbitrarily many times, but a row is never
-//! duplicated and never appended.
-//!
-//! # Design
-//!
-//! The screen is a fixed-height grid, one row per entry.  Each row is 1 or 2
-//! terminal lines tall (primary + optional sub-line).
-//!
-//! ## Event loop
-//!
-//! Rather than rendering on every event, the loop drains *all* currently
-//! pending events from the channel in a single synchronous pass, then renders
-//! once.  This prevents the burst of TYPE/BART events that arrive in quick
-//! succession from causing repeated redraws of the same partial state.
-//!
-//! ## Redraw
-//!
-//! Before each frame: `MoveToPreviousLine(prev_line_count)` returns the cursor
-//! to the top of the grid.  Only rows whose content changed since the last
-//! frame are redrawn; unchanged rows are skipped with `MoveToNextLine`.
-//!
-//! ## stderr isolation
-//!
-//! While the live grid is displayed, nothing writes to stderr.  Provider
-//! warnings are stored in `pending_warnings` and flushed to stderr *after*
-//! the grid exits (on `PipelineComplete` or channel close).  This prevents
-//! API error bodies from appearing inside the terminal grid.
+//! In TTY mode, work still in flight is shown as real-time cascading progress
+//! scan bars (see [`form3::scan`]) animated from the wall clock at
+//! [`ANIM_FRAME`], separately from the slower metadata carousel. Each
+//! pipeline result is drawn on the next animation frame after it arrives;
+//! repaints are coalesced to that frame rate so a stream of per-item events
+//! cannot cause a redraw storm.
 
 use crate::{
     format::{
@@ -42,13 +20,14 @@ use crate::{
     state::EntryDisplayState,
     telemetry::Telemetry,
 };
-use crossterm::{cursor, style, terminal, QueueableCommand};
+use form3::{ansi, scan, scan::Cascade};
 use gls_core::{
     entry::EntryKind,
     event::{PipelineEvent, ToolProgress, ToolState},
     pipeline::{PipelineReceiver, PresentationState},
 };
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -61,6 +40,14 @@ const ROW_CONTEXT_MAX_CHARS: usize = 70;
 /// cells sit side-by-side with others in the same category block, so
 /// staying compact here matters far more than in a full-width row.
 pub(crate) const GRID_CONTEXT_MAX_CHARS: usize = 22;
+
+/// Timing of the cascading scan bars: one sweep every 1.1 s, each row (and
+/// each concurrently running HUD tool) trailing the previous by 8% of a cycle.
+pub(crate) const SCAN_CASCADE: Cascade = Cascade::new(Duration::from_millis(1100), 0.08);
+/// Width, in cells, of a per-entry scan bar.
+const ENTRY_BAR_WIDTH: usize = 6;
+/// Width, in cells, of a per-tool HUD progress scan bar.
+pub(crate) const HUD_BAR_WIDTH: usize = 8;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
@@ -108,19 +95,20 @@ impl Default for RenderConfig {
 /// Current terminal width in columns, falling back to 80 when it cannot be
 /// determined (e.g. output is not attached to a TTY).
 fn terminal_width() -> u16 {
-    terminal::size().map(|(w, _)| w).unwrap_or(80)
+    #[cfg(unix)]
+    {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
+            && size.ws_col > 0
+        {
+            return size.ws_col;
+        }
+    }
+    80
 }
 
 fn atty_check() -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe { libc::isatty(io::stdout().as_raw_fd()) == 1 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    io::stdout().is_terminal()
 }
 
 /// The renderer.
@@ -198,7 +186,7 @@ async fn plain_run(mut rx: PipelineReceiver, grid: bool) {
     }
 
     // Print the final telemetry HUD before the listing.
-    let hud = telemetry.render(false);
+    let hud = telemetry.render(false, Duration::ZERO);
     let _ = writeln!(io::stdout(), "{hud}");
 
     if grid {
@@ -243,14 +231,17 @@ struct RenderedRow {
     secondary: Option<String>,
 }
 
-impl RenderedRow {
-    fn line_count(&self) -> u16 {
-        if self.secondary.is_some() {
-            2
-        } else {
-            1
-        }
-    }
+/// Repaint cadence for scan-bar animation (≈15 fps). Also the upper bound on
+/// how long a freshly computed result waits before it is drawn.
+const ANIM_FRAME: Duration = Duration::from_millis(66);
+
+/// Whether anything on screen is still in flight and needs its scan bar
+/// animated: a pending insight layer on some entry, or a running tool.
+fn is_animating(entries: &HashMap<PathBuf, EntryDisplayState>, telemetry: &Telemetry) -> bool {
+    telemetry.any_running()
+        || entries
+            .values()
+            .any(|s| s.classification.is_none() || s.context_pending)
 }
 
 async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid: bool) {
@@ -261,22 +252,28 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
     let mut queue = QueueTracker::default();
     let mut telemetry = Telemetry::default();
 
-    // Only used in `!grid` mode (line-diffed retained rendering).
-    let mut prev_rows: Vec<RenderedRow> = Vec::new();
     let mut prev_line_count: u16 = 0;
 
+    // `None` means animation was explicitly disabled: bars still render, but
+    // frozen, and no fast animation frames are scheduled.
+    let animate = tick_interval.is_some();
     let interval = tick_interval.unwrap_or(Duration::from_millis(600));
-    // Tracked as a wall-clock deadline rather than a `tokio::time::Interval`
-    // raced inside `select!`. TYPE/BART/context events for a real directory
-    // keep arriving back-to-back, which keeps `rx.recv()` ready on almost
-    // every poll — with `biased` select preferring that branch, an
-    // interval future raced against it would starve and never fire, so the
-    // spinner would appear to freeze even though results keep streaming in.
-    // `select!` below only decides *when we wake up*; whether a frame
-    // actually advances is decided afterwards purely by elapsed time.
-    let mut next_tick = tokio::time::Instant::now() + interval;
+    // Both clocks are tracked as wall-clock deadlines rather than
+    // `tokio::time::Interval`s raced inside `select!`: per-item events keep
+    // `rx.recv()` ready on almost every poll, and with `biased` select an
+    // interval future would starve. `select!` only decides *when we wake
+    // up*; what happens is decided afterwards purely by elapsed time.
+    //
+    // `next_tick` drives the slow metadata carousel; `next_frame` gates
+    // repaints (scan-bar motion and newly arrived results).
+    let anim_epoch = tokio::time::Instant::now();
+    let mut next_tick = anim_epoch + interval;
+    let mut next_frame = anim_epoch;
+    // Something changed since the last repaint.
+    let mut dirty = false;
 
     let mut pipeline_done = false;
+    let mut channel_closed = false;
     // Once the pipeline completes, keep the carousel ticking long enough for
     // the user to see the rotating metadata layers (type, metrics, context).
     // If context is enabled we also wait for in-flight context calls to
@@ -288,11 +285,44 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
     const POST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
     let mut pipeline_done_at: Option<tokio::time::Instant> = None;
 
-    'outer: loop {
-        // ── Wait for the next wakeup (event or tick deadline) ─────────────────
+    let paint = |entries: &mut HashMap<PathBuf, EntryDisplayState>,
+                 order: &[PathBuf],
+                 queue: &QueueTracker,
+                 telemetry: &Telemetry,
+                 now: tokio::time::Instant,
+                 prev_line_count: &mut u16| {
+        if order.is_empty() {
+            return;
+        }
+        let elapsed = if animate {
+            now.duration_since(anim_epoch)
+        } else {
+            Duration::ZERO
+        };
+        // Each row's bars lag the row above, so sweeps cascade down the list.
+        for (slot, path) in order.iter().enumerate() {
+            if let Some(s) = entries.get_mut(path) {
+                s.scan_phase = SCAN_CASCADE.phase(elapsed, slot);
+            }
+        }
+        let hud = telemetry.render(true, elapsed);
+        if grid {
+            render_grid_frame(entries, order, queue, &hud, prev_line_count);
+        } else {
+            retained_render(entries, order, queue, &hud, prev_line_count);
+        }
+    };
+
+    loop {
+        // ── Wait for the next wakeup (event, carousel tick, or frame) ─────────
+        let wake_at = if dirty || (animate && is_animating(&entries, &telemetry)) {
+            next_tick.min(next_frame)
+        } else {
+            next_tick
+        };
         tokio::select! {
             biased;
-            result = rx.recv() => {
+            result = rx.recv(), if !channel_closed => {
                 match result {
                     Some(ev) => {
                         let done = matches!(ev, PipelineEvent::PipelineComplete);
@@ -304,18 +334,17 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                             &mut telemetry,
                             ev,
                         );
+                        dirty = true;
                         if done { pipeline_done = true; }
                     }
-                    None => { pipeline_done = true; }
+                    None => { pipeline_done = true; channel_closed = true; }
                 }
             }
-            _ = tokio::time::sleep_until(next_tick) => {}
+            _ = tokio::time::sleep_until(wake_at) => {}
         }
 
         // ── Drain any additional events that arrived in the same burst ────────
-        // This is the key fix: instead of rendering after *every* event, we
-        // consume everything currently in the channel before rendering once.
-        // Each entry's own state (and the queue tracker) is still updated
+        // Each entry's own state (and the queue tracker) is updated
         // immediately as its events are applied here — nothing waits for
         // any other entry to finish anything.
         loop {
@@ -330,6 +359,7 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                         &mut telemetry,
                         ev,
                     );
+                    dirty = true;
                     if done {
                         pipeline_done = true;
                     }
@@ -337,18 +367,13 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     pipeline_done = true;
+                    channel_closed = true;
                     break;
                 }
             }
         }
 
-        // ── Advance animation frames once the deadline has actually passed ────
-        // Checked by wall clock, independent of which `select!` branch woke
-        // us — otherwise a busy event stream would win that race every time
-        // and the "thinking" spinner would never move. Purely cosmetic
-        // (which spinner glyph to show for still-pending work) — it no
-        // longer gates *which* completed sub-result is visible, since those
-        // are all shown the instant they arrive.
+        // ── Advance the carousel once its deadline has actually passed ───────
         let now = tokio::time::Instant::now();
         if now >= next_tick {
             for path in &order {
@@ -357,26 +382,27 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
                 }
             }
             next_tick = now + interval;
+            dirty = true;
             if pipeline_done {
                 done_ticks += 1;
             }
         }
 
-        // ── Render once ───────────────────────────────────────────────────────
-        if !order.is_empty() {
-            let hud = telemetry.render(true);
-            if grid {
-                render_grid_frame(&entries, &order, &queue, &hud, &mut prev_line_count);
-            } else {
-                retained_render(
-                    &entries,
-                    &order,
-                    &queue,
-                    &hud,
-                    &mut prev_rows,
-                    &mut prev_line_count,
-                );
-            }
+        // ── Repaint at most once per animation frame ──────────────────────────
+        // New results and scan-bar motion both land here; coalescing to
+        // `ANIM_FRAME` keeps a fast event stream from redrawing per event.
+        let animating = animate && is_animating(&entries, &telemetry);
+        if (dirty || animating) && now >= next_frame {
+            paint(
+                &mut entries,
+                &order,
+                &queue,
+                &telemetry,
+                now,
+                &mut prev_line_count,
+            );
+            dirty = false;
+            next_frame = now + ANIM_FRAME;
         }
 
         if pipeline_done && pipeline_done_at.is_none() {
@@ -391,12 +417,21 @@ async fn tty_run(mut rx: PipelineReceiver, tick_interval: Option<Duration>, grid
             && done_ticks >= DONE_TICK_TARGET
             && (context_settled || post_completion_timed_out)
         {
-            break 'outer;
+            // Never exit on a stale frame that was deferred by throttling.
+            if dirty {
+                paint(
+                    &mut entries,
+                    &order,
+                    &queue,
+                    &telemetry,
+                    now,
+                    &mut prev_line_count,
+                );
+            }
+            break;
         }
     }
 
-    // Leave cursor on a clean line below the output.
-    let _ = io::stdout().write_all(b"\n");
     let _ = io::stdout().flush();
 
     // Now safe to flush deferred warnings to stderr.
@@ -418,111 +453,64 @@ fn render_grid_frame(
     hud: &str,
     prev_line_count: &mut u16,
 ) {
-    let mut stdout = io::stdout();
-    if *prev_line_count > 0 {
-        let _ = stdout.queue(cursor::MoveToPreviousLine(*prev_line_count));
-        let _ = stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown));
-    }
     let rendered = crate::grid::render_grid(entries, order, queue, terminal_width(), true);
-    let _ = stdout.queue(style::Print(format!("{hud}\n{rendered}")));
-    let _ = stdout.flush();
-    // HUD line + grid lines.
-    *prev_line_count = 1 + rendered.matches('\n').count() as u16;
+    let frame = format!("{hud}\n{rendered}");
+    write_frame(&mut io::stdout(), &frame, prev_line_count);
 }
 
-// ── Retained-mode redraw ──────────────────────────────────────────────────────
-
+// Repaint from the top whenever row heights change. Diffing individual rows
+// cannot safely account for a secondary line appearing or disappearing.
 fn retained_render(
     entries: &HashMap<PathBuf, EntryDisplayState>,
     order: &[PathBuf],
     queue: &QueueTracker,
     hud: &str,
-    prev_rows: &mut Vec<RenderedRow>,
     prev_line_count: &mut u16,
 ) {
-    let new_rows: Vec<RenderedRow> = order
+    let rows: Vec<RenderedRow> = order
         .iter()
         .filter_map(|p| entries.get(p))
         .map(|s| render_row(s, queue))
         .collect();
-
-    let mut stdout = io::stdout();
-
-    // ── First paint: print everything downward from current cursor ────────────
-    if prev_rows.is_empty() {
-        let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-        let _ = stdout.queue(style::Print(hud));
-        let _ = stdout.queue(cursor::MoveToNextLine(1));
-        for row in &new_rows {
-            let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-            let _ = stdout.queue(style::Print(&row.primary));
-            let _ = stdout.queue(cursor::MoveToNextLine(1));
-            if let Some(ref sec) = row.secondary {
-                let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-                let _ = stdout.queue(style::Print(format!("   {sec}")));
-                let _ = stdout.queue(cursor::MoveToNextLine(1));
-            }
+    let mut frame = format!("{hud}\n");
+    for row in &rows {
+        frame.push_str(&row.primary);
+        frame.push('\n');
+        if let Some(secondary) = &row.secondary {
+            frame.push_str("   ");
+            frame.push_str(secondary);
+            frame.push('\n');
         }
-        let _ = stdout.flush();
-        *prev_line_count = 1 + new_rows.iter().map(|r| r.line_count()).sum::<u16>();
-        *prev_rows = new_rows;
-        return;
     }
+    write_frame(&mut io::stdout(), &frame, prev_line_count);
+}
 
-    // ── Subsequent paints: move to top of grid, selectively overdraw ──────────
-    let _ = stdout.queue(cursor::MoveToPreviousLine(*prev_line_count));
-
-    // Redraw HUD line.
-    let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-    let _ = stdout.queue(style::Print(hud));
-    let _ = stdout.queue(cursor::MoveToNextLine(1));
-
-    let mut new_total: u16 = 0;
-    let mut prev_iter = prev_rows.iter();
-
-    for row in &new_rows {
-        let prev = prev_iter.next();
-        let changed = prev.map(|r| r != row).unwrap_or(true);
-
-        if changed {
-            // Redraw primary line (clear to EOL first to erase stale content).
-            let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-            let _ = stdout.queue(style::Print(&row.primary));
-            let _ = stdout.queue(cursor::MoveToNextLine(1));
-
-            match (&row.secondary, prev.and_then(|r| r.secondary.as_ref())) {
-                (Some(sec), _) => {
-                    let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-                    let _ = stdout.queue(style::Print(format!("   {sec}")));
-                    let _ = stdout.queue(cursor::MoveToNextLine(1));
-                }
-                (None, Some(_)) => {
-                    // Row shrank: erase the old secondary line.
-                    let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-                    let _ = stdout.queue(cursor::MoveToNextLine(1));
-                }
-                (None, None) => { /* single-line row, no change in height */ }
-            }
-        } else {
-            let _ = stdout.queue(cursor::MoveToNextLine(row.line_count()));
-        }
-
-        new_total += row.line_count();
+/// Repaint `frame` over the previous one.
+///
+/// Each line is cleared just before it is rewritten (rather than wiping the
+/// whole region first and then redrawing), and the repaint is wrapped in a
+/// synchronized update, so ~15 fps scan-bar animation doesn't flicker.
+/// Anything left below a frame that shrank is cleared at the end.
+fn write_frame(output: &mut impl Write, frame: &str, prev_line_count: &mut u16) {
+    let mut buf = String::with_capacity(frame.len() + 256);
+    buf.push_str(ansi::begin_synchronized_update());
+    if *prev_line_count > 0 {
+        buf.push_str(&ansi::move_up(*prev_line_count));
     }
-
-    // Erase any leftover lines if grid shrank.
-    if new_total < *prev_line_count - 1 {
-        let leftover = *prev_line_count - 1 - new_total;
-        for _ in 0..leftover {
-            let _ = stdout.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-            let _ = stdout.queue(cursor::MoveToNextLine(1));
-        }
-        let _ = stdout.queue(cursor::MoveToPreviousLine(leftover));
+    buf.push('\r');
+    for line in frame.split_inclusive('\n') {
+        buf.push_str(ansi::clear_line());
+        buf.push_str(line);
     }
-
-    let _ = stdout.flush();
-    *prev_line_count = 1 + new_total;
-    *prev_rows = new_rows;
+    buf.push_str(ansi::clear_to_end_of_screen());
+    buf.push_str(ansi::end_synchronized_update());
+    let _ = output.write_all(buf.as_bytes());
+    let _ = output.flush();
+    *prev_line_count = frame
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        .min(u16::MAX as usize) as u16;
 }
 
 // ── Row rendering ─────────────────────────────────────────────────────────────
@@ -558,7 +546,12 @@ fn carousel_frame(
         0 => None,
         1 => Some(type_carousel_frame(state, color)),
         2 => Some(metrics_carousel_frame(state, color)),
-        3 => Some(context_carousel_frame(state, queue, context_max_chars, color)),
+        3 => Some(context_carousel_frame(
+            state,
+            queue,
+            context_max_chars,
+            color,
+        )),
         _ => unreachable!(),
     }
 }
@@ -585,10 +578,12 @@ fn metrics_carousel_frame(state: &EntryDisplayState, color: bool) -> String {
         if !line.is_empty() {
             line
         } else {
-            loading_line(state, "metrics", color)
+            // Fallback to type+size when metrics are empty
+            type_carousel_frame(state, color)
         }
     } else {
-        loading_line(state, "metrics", color)
+        // Fallback to type+size when metrics are not yet available
+        type_carousel_frame(state, color)
     }
 }
 
@@ -606,7 +601,11 @@ fn context_carousel_frame(
         }
     } else if state.context_failed {
         let msg = "⚠ context unavailable";
-        if color { dim(msg) } else { msg.to_string() }
+        if color {
+            dim(msg)
+        } else {
+            msg.to_string()
+        }
     } else if state.context_pending {
         loading_line(state, "context", color)
     } else if let Some(q) = queue.status_for(&state.path) {
@@ -614,10 +613,18 @@ fn context_carousel_frame(
             "in line for {}, position {} of {} \u{b7} eta {}s",
             q.provider, q.position, q.total, q.eta_secs
         );
-        if color { dim(&msg) } else { msg }
+        if color {
+            dim(&msg)
+        } else {
+            msg
+        }
     } else {
         let msg = "—";
-        if color { dim(msg) } else { msg.to_string() }
+        if color {
+            dim(msg)
+        } else {
+            msg.to_string()
+        }
     }
 }
 
@@ -658,9 +665,8 @@ pub(crate) fn live_status_line(
         if !line.is_empty() {
             dims.push(line);
         }
-    } else {
-        dims.push(loading_line(state, "metrics", color));
     }
+    // Note: we don't show a loader for metrics in grid mode - type+size is always shown above
 
     // Context layer: real content once ready, an active spinner once the
     // provider call has actually started, a queue position/ETA while still
@@ -693,33 +699,39 @@ pub(crate) fn live_status_line(
     dims.join(&sep)
 }
 
-/// A compact progress item for an unfinished insight layer.
+/// A compact progress item for an unfinished insight layer: a real-time
+/// scan bar followed by the layer name.
+///
+/// `scan_phase` is set from the wall clock each animation frame, offset by
+/// the entry's row so bars cascade down the listing. Layers within the same
+/// entry continue that cascade one step further each, so the type and
+/// context bars on one grid cell are visibly distinct.
 fn loading_line(state: &EntryDisplayState, layer: &str, color: bool) -> String {
-    // `spinner_index` advances every tick independently of the carousel
-    // frame, so a loading indicator keeps moving even when its layer is
-    // off-screen. Offsets keep multiple simultaneous loaders visually
-    // distinct (e.g. in grid mode).
-    const FRAMES: [&str; 4] = ["◌", "◍", "●", "◍"];
-    let offset = match layer {
-        "type" => 0,
-        "metrics" => 1,
-        _ => 2,
+    let layer_slot = match layer {
+        "type" => 0.0,
+        "metrics" => 1.0,
+        _ => 2.0,
     };
-    let marker = FRAMES[(state.spinner_index + offset) % FRAMES.len()];
+    let phase = SCAN_CASCADE.lag(state.scan_phase, layer_slot);
+    let colour = color.then(|| {
+        let c = match layer {
+            "type" => ansi::Color::Yellow,
+            "metrics" => ansi::Color::Green,
+            _ => ansi::Color::Magenta,
+        };
+        ansi::AnsiColor::Standard(c, false)
+    });
+    let bar = scan::scan_bar(phase, ENTRY_BAR_WIDTH, colour.as_ref());
     let label = match layer {
-        "type" => "thinking type",
-        "metrics" => "thinking metrics",
-        _ => "thinking context",
+        "type" => "type",
+        "metrics" => "metrics",
+        _ => "context",
     };
-    if !color {
-        return format!("{marker} {label}");
+    if color {
+        format!("{bar} {}", dim(label))
+    } else {
+        format!("{bar} {label}")
     }
-    let colour = match layer {
-        "type" => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Yellow, false)),
-        "metrics" => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Green, false)),
-        _ => form3::ansi::fg(&form3::ansi::AnsiColor::Standard(form3::ansi::Color::Magenta, false)),
-    };
-    format!("{colour}{marker}{} {label}", form3::ansi::reset())
 }
 
 /// Best sub-line for plain (non-animated) output. This prints once, after
@@ -912,16 +924,39 @@ fn apply_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_repaint_clears_old_lines_and_tracks_new_height() {
+        let mut output = Vec::new();
+        let mut lines = 0;
+        super::write_frame(&mut output, "hud\nentry\nextra\n", &mut lines);
+        assert_eq!(lines, 3);
+        output.clear();
+        super::write_frame(&mut output, "hud\nentry\n", &mut lines);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with(&format!(
+            "{}{}\r",
+            form3::ansi::begin_synchronized_update(),
+            form3::ansi::move_up(3)
+        )));
+        // Every line is cleared right before it is rewritten…
+        assert!(text.contains(&format!("{}hud\n", form3::ansi::clear_line())));
+        assert!(text.contains(&format!("{}entry\n", form3::ansi::clear_line())));
+        // …and leftovers from the taller previous frame are wiped.
+        assert!(text.ends_with(&format!(
+            "{}{}",
+            form3::ansi::clear_to_end_of_screen(),
+            form3::ansi::end_synchronized_update()
+        )));
+        assert_eq!(lines, 2);
+    }
+
     use super::*;
     use gls_core::semantic::{Classification, SemanticType};
     use std::path::PathBuf;
 
     fn test_state(frame_index: usize) -> EntryDisplayState {
-        let mut s = EntryDisplayState::new(
-            PathBuf::from("/tmp/demo.rs"),
-            "demo.rs".to_string(),
-            false,
-        );
+        let mut s =
+            EntryDisplayState::new(PathBuf::from("/tmp/demo.rs"), "demo.rs".to_string(), false);
         s.frame_index = frame_index;
         s
     }
@@ -939,7 +974,11 @@ mod tests {
         let queue = QueueTracker::default();
         let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
             .expect("frame 1 should have a sub-line");
-        assert!(line.contains("thinking type"));
+        assert!(line.ends_with(" type"));
+        assert!(
+            line.contains('─'),
+            "pending type should show a scan bar: {line}"
+        );
     }
 
     #[test]
@@ -954,16 +993,19 @@ mod tests {
         let queue = QueueTracker::default();
         let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
             .expect("frame 1 should have a sub-line");
-        assert!(!line.contains("thinking type"));
+        assert!(
+            !line.contains('─'),
+            "classified type should not scan: {line}"
+        );
     }
 
     #[test]
-    fn carousel_frame_two_shows_metrics_loader_when_missing() {
+    fn carousel_frame_two_shows_type_fallback_when_metrics_missing() {
         let state = test_state(2);
         let queue = QueueTracker::default();
         let line = carousel_frame(&state, &queue, ROW_CONTEXT_MAX_CHARS, false)
             .expect("frame 2 should have a sub-line");
-        assert!(line.contains("thinking metrics"));
+        assert!(line.ends_with(" type") && line.contains('─'));
     }
 
     #[test]
@@ -976,11 +1018,45 @@ mod tests {
     }
 
     #[test]
-    fn spinner_index_advances_independently_of_carousel_frame() {
+    fn carousel_tick_does_not_drive_scan_motion() {
         let mut state = test_state(1);
-        state.spinner_index = 0;
+        state.scan_phase = 0.25;
         state.tick_frame();
         assert_eq!(state.frame_index, 2);
-        assert_eq!(state.spinner_index, 1);
+        assert_eq!(state.scan_phase, 0.25);
+    }
+
+    #[test]
+    fn loading_bar_follows_scan_phase_and_cascades_by_row() {
+        let mut a = test_state(1);
+        let mut b = test_state(1);
+        let t = Duration::from_millis(400);
+        a.scan_phase = SCAN_CASCADE.phase(t, 0);
+        b.scan_phase = SCAN_CASCADE.phase(t, 5);
+        let la = loading_line(&a, "type", false);
+        let lb = loading_line(&b, "type", false);
+        assert_ne!(la, lb, "rows should be offset in the cascade");
+        assert_eq!(
+            form3::width::display_width(&la),
+            form3::width::display_width(&loading_line(&a, "type", true)),
+            "plain and coloured widths must match for grid layout"
+        );
+    }
+
+    #[test]
+    fn grid_status_shows_scan_bars_for_pending_layers() {
+        let mut state = test_state(0);
+        state.context_pending = true;
+        let line = live_status_line(
+            &state,
+            &QueueTracker::default(),
+            GRID_CONTEXT_MAX_CHARS,
+            false,
+        );
+        assert!(
+            line.contains(" type") && line.contains(" context"),
+            "{line}"
+        );
+        assert!(!line.contains("thinking"));
     }
 }
